@@ -1310,13 +1310,23 @@ async def update_loop():
         await asyncio.sleep(settings.POLL_INTERVAL_MS / 1000)
 
 
+def render_template(template_name: str, request: Request, context: Optional[Dict[str, Any]] = None):
+    ctx = {"request": request}
+    if context:
+        ctx.update(context)
+    try:
+        return templates.TemplateResponse(request=request, name=template_name, context=ctx)
+    except TypeError:
+        return templates.TemplateResponse(template_name, ctx)
+
+
 @app.get("/", response_class=HTMLResponse)
 async def get_dashboard(request: Request):
-    return templates.TemplateResponse("index.html", {"request": request})
+    return render_template("index.html", request)
 
 @app.get("/settings", response_class=HTMLResponse)
 async def get_settings_page(request: Request):
-    return templates.TemplateResponse("settings.html", {"request": request})
+    return render_template("settings.html", request)
 
 @app.get("/api/latest")
 async def get_latest():
@@ -1603,4 +1613,5 @@ async def get_history():
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8010)
+    port = int(os.getenv("PORT", 8010))
+    uvicorn.run(app, host="0.0.0.0", port=port)

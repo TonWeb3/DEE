@@ -16,11 +16,11 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
 
 # Environment variables
-ENV PORT=8000
+ENV PORT=8010
 ENV SYMBOL=BTCUSDT
 ENV POLL_INTERVAL_MS=1000
 
-EXPOSE 8000
+EXPOSE 8010
 
 # Use gunicorn with uvicorn workers for production stability
 CMD gunicorn -w 1 -k uvicorn.workers.UvicornWorker main:app --bind 0.0.0.0:$PORT

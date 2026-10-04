@@ -15,3 +15,9 @@ def get_proxy_url_for(target_url: str) -> str:
         return http_proxy or all_proxy or ""
 
     return all_proxy or https_proxy or http_proxy or ""
+
+def get_httpx_proxies(target_url: str):
+    proxy_url = get_proxy_url_for(target_url)
+    if not proxy_url:
+        return None
+    return proxy_url

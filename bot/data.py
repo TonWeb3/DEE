@@ -133,88 +133,39 @@ async def fetch_order_book(token_id: str) -> Dict:
         res.raise_for_status()
         return res.json()
 
-def _levels(raw, reverse: bool):
-    """(price, size) pairs ordered from the TOUCH outward.
-
-    Polymarket returns `bids` ASCENDING and `asks` DESCENDING by price, so the best
-    price of each side is the LAST element, not the first. Slicing [:n] off the raw
-    arrays therefore summed the n WORST levels — depth resting far from the touch, at
-    prices we would never trade — and reported it as tradable liquidity. Sort here so
-    every caller is measuring the book it can actually hit.
-    """
-    out = []
-    for lvl in raw or []:
-        p = to_number(lvl.get("price"))
-        s = to_number(lvl.get("size"))
-        if p is not None and s is not None and s > 0:
-            out.append((p, s))
-    return sorted(out, key=lambda x: x[0], reverse=reverse)
-
-
 def summarize_order_book(book: Dict, depth_levels: int = 5) -> Dict:
-    bid_levels = _levels(book.get("bids"), reverse=True)    # highest price first
-    ask_levels = _levels(book.get("asks"), reverse=False)   # lowest price first
+    bids = book.get("bids", [])
+    asks = book.get("asks", [])
 
-    best_bid = bid_levels[0][0] if bid_levels else None
-    best_ask = ask_levels[0][0] if ask_levels else None
+    best_bid = None
+    if bids:
+        for lvl in bids:
+            p = to_number(lvl.get("price"))
+            if p is not None:
+                best_bid = max(best_bid, p) if best_bid is not None else p
+
+    best_ask = None
+    if asks:
+        for lvl in asks:
+            p = to_number(lvl.get("price"))
+            if p is not None:
+                best_ask = min(best_ask, p) if best_ask is not None else p
+
     spread = best_ask - best_bid if best_bid is not None and best_ask is not None else None
+    # Midpoint = what Polymarket displays as the market price. Fall back to whichever
+    # side exists if the book is one-sided.
+    if best_bid is not None and best_ask is not None:
+        mid = (best_bid + best_ask) / 2.0
+    else:
+        mid = best_bid if best_bid is not None else best_ask
+    bid_liquidity = sum(to_number(lvl.get("size")) or 0 for lvl in bids[:depth_levels])
+    ask_liquidity = sum(to_number(lvl.get("size")) or 0 for lvl in asks[:depth_levels])
 
     return {
         "bestBid": best_bid,
         "bestAsk": best_ask,
+        "mid": mid,
         "spread": spread,
-        "bidLiquidity": sum(s for _, s in bid_levels[:depth_levels]),
-        "askLiquidity": sum(s for _, s in ask_levels[:depth_levels]),
-        # kept so a caller can price a real fill by walking the book instead of
-        # assuming the whole stake clears at the touch
-        "askLevels": ask_levels[:depth_levels],
-        "bidLevels": bid_levels[:depth_levels],
+        "bidLiquidity": bid_liquidity,
+        "askLiquidity": ask_liquidity
     }
-
-
-def sweep_sell(bid_levels, size: float):
-    """Walk the BID side (best-first) selling up to `size` shares — the mirror of
-    `fill_price_for_usd`. Returns (all_in_avg_price, shares_sold, usd_proceeds).
-
-    Selling a whole position walks DOWN the bids exactly as buying walks up the asks,
-    so valuing the exit at the best bid overstates what a real liquidation returns.
-    `shares_sold < size` means the visible book cannot absorb the whole position — a
-    Fill-Or-Kill sell of it would simply be killed.
-    """
-    if size <= 0 or not bid_levels:
-        return None, 0.0, 0.0
-    remaining = float(size)
-    sold = 0.0
-    proceeds = 0.0
-    for price, avail in bid_levels:
-        take = min(avail, remaining)
-        if take <= 0:
-            break
-        sold += take
-        proceeds += take * price
-        remaining -= take
-        if remaining <= 1e-9:
-            break
-    if sold <= 0:
-        return None, 0.0, 0.0
-    return proceeds / sold, sold, proceeds
-
-
-def fill_price_for_usd(ask_levels, usd: float):
-    """Average price paid to spend `usd` walking the asks, and the shares it buys.
-
-    A marketable order eats level 1, then level 2, and so on; pricing the whole stake
-    at the touch flatters every fill. Returns (avg_price, shares, filled_usd) — with
-    filled_usd < usd when the visible book cannot absorb the whole order.
-    """
-    spend = 0.0
-    shares = 0.0
-    for price, size in ask_levels or []:
-        if spend >= usd or price <= 0:
-            break
-        take_usd = min(usd - spend, price * size)
-        spend += take_usd
-        shares += take_usd / price
-    if shares <= 0:
-        return None, 0.0, 0.0
-    return spend / shares, shares, spend

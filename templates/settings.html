@@ -108,48 +108,24 @@
                     </div>
                     <p class="text-[10px] text-gray-500 mt-2 italic">When on, an open position is sold and reversed if the opposite side clears the conviction and time thresholds (sells into the book in live mode).</p>
                 </div>
-            </div>
 
-            <!-- Auto-withdrawal (capital extractor) -->
-            <div class="bg-gray-800 p-5 sm:p-6 rounded-lg shadow-lg">
-                <h2 class="text-lg sm:text-xl font-bold mb-4 border-b border-gray-700 pb-2">Auto-Withdrawal (Capital Extractor)</h2>
-                <label class="flex items-center gap-2 mb-4">
-                    <input type="checkbox" x-model="form.capital_extractor.enabled" class="w-4 h-4">
-                    <span class="text-sm font-bold text-emerald-400 uppercase">Enable auto-withdrawal</span>
-                </label>
-                <div class="grid grid-cols-1 md:grid-cols-2 gap-4 sm:gap-6" :class="form.capital_extractor.enabled ? '' : 'opacity-50 pointer-events-none'">
-                    <div>
-                        <label class="block text-gray-400 text-xs sm:text-sm mb-2 uppercase font-bold tracking-wider">Trigger Balance ($)</label>
-                        <input type="number" step="1" min="0" x-model.number="form.capital_extractor.trigger_balance" class="w-full bg-gray-700 border-none rounded-lg p-3 text-white focus:ring-2 focus:ring-blue-500 transition">
-                        <p class="text-[10px] text-gray-500 mt-2 italic">Withdraw once <strong>equity</strong> (cash + any open position) reaches this (e.g. 2000).</p>
+                <div class="p-4 bg-gray-900/50 rounded-lg border border-gray-700 mt-4">
+                    <label class="flex items-center gap-2 mb-3">
+                        <input type="checkbox" x-model="form.tp_sl.enabled" class="w-4 h-4">
+                        <span class="text-sm font-bold text-emerald-400 uppercase">Take-Profit / Stop-Loss (early exit)</span>
+                    </label>
+                    <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                        <div>
+                            <label class="block text-[10px] text-gray-500 mb-1 uppercase">Take Profit (% of stake)</label>
+                            <input type="number" step="1" min="1" x-model.number="form.tp_sl.take_profit_pct" class="w-full bg-gray-700 border-none rounded p-2 text-xs text-white">
+                        </div>
+                        <div>
+                            <label class="block text-[10px] text-gray-500 mb-1 uppercase">Stop Loss (% of stake)</label>
+                            <input type="number" step="1" min="1" x-model.number="form.tp_sl.stop_loss_pct" class="w-full bg-gray-700 border-none rounded p-2 text-xs text-white">
+                        </div>
                     </div>
-                    <div>
-                        <label class="block text-gray-400 text-xs sm:text-sm mb-2 uppercase font-bold tracking-wider">Withdraw Amount ($)</label>
-                        <input type="number" step="1" min="0" x-model.number="form.capital_extractor.withdraw_amount" class="w-full bg-gray-700 border-none rounded-lg p-3 text-white focus:ring-2 focus:ring-blue-500 transition">
-                        <p class="text-[10px] text-gray-500 mt-2 italic">Amount of pUSD to withdraw each time (e.g. 1000 = half of 2000).</p>
-                    </div>
-                    <div class="md:col-span-2">
-                        <label class="block text-gray-400 text-xs sm:text-sm mb-2 uppercase font-bold tracking-wider">Withdraw To (destination address)</label>
-                        <input type="text" x-model="form.capital_extractor.withdraw_address" class="w-full bg-gray-700 border-none rounded-lg p-3 text-white focus:ring-2 focus:ring-blue-500 transition" placeholder="0x... wallet that receives the pUSD (blank = your own key/seed wallet)">
-                        <p class="text-[10px] text-gray-500 mt-2 italic">The pUSD is sent here (gasless). Leave blank to send to <strong>your own wallet</strong> (the key/seed EOA). Double-check the address — withdrawals move real funds and cannot be undone.</p>
-                    </div>
-                    <div>
-                        <label class="flex items-center gap-2 mt-1">
-                            <input type="checkbox" x-model="form.capital_extractor.auto_resume_after_withdrawal" class="w-4 h-4">
-                            <span class="text-sm text-gray-300">Auto-resume trading after withdrawal</span>
-                        </label>
-                        <p class="text-[10px] text-gray-500 mt-2 italic">Off = the bot stops entirely once the withdrawal is done.</p>
-                    </div>
-                    <div>
-                        <label class="block text-gray-400 text-xs sm:text-sm mb-2 uppercase font-bold tracking-wider">Resume After</label>
-                        <select x-model="form.capital_extractor.resume_after" class="w-full bg-gray-700 border-none rounded-lg p-3 text-white focus:ring-2 focus:ring-blue-500 transition">
-                            <option value="submitted">Transaction submitted (faster)</option>
-                            <option value="confirmed">Confirmed on-chain (safer)</option>
-                        </select>
-                        <p class="text-[10px] text-gray-500 mt-2 italic">"Confirmed" waits for the receipt, up to 3 minutes, before resuming.</p>
-                    </div>
+                    <p class="text-[10px] text-gray-500 mt-2 italic">Closes the open position early when its value moves ±this % of the amount risked (e.g. 30 = up/down 30%). After it fires, no new entry until the next 15m market starts.</p>
                 </div>
-                <p class="text-[10px] text-gray-500 mt-3 italic"><strong>Live mode only.</strong> When equity ≥ trigger: pause new entries → sell any open position at the bid to go flat → withdraw the amount → resume at the next 15m market.</p>
             </div>
 
             <!-- Telegram alerts -->
@@ -169,7 +145,7 @@
                                 <span x-text="tgBusy ? 'Sending…' : 'Send Test'"></span>
                             </button>
                         </div>
-                        <p class="text-[10px] text-gray-500 mt-2 italic">Create a bot with @BotFather on Telegram and paste its token here. A stored token is shown only as "set".</p>
+                        <p class="text-[10px] text-gray-500 mt-2 italic">Create a bot with @BotFather on Telegram and paste its token here. Only the stored value is shown as "set".</p>
                     </div>
                     <div class="md:col-span-2">
                         <div class="flex items-center justify-between mb-2">
@@ -192,8 +168,9 @@
                             </template>
                             <p x-show="tgSubs.length === 0" class="text-xs text-gray-500 italic py-2">No subscribers yet. Anyone who sends a message to the bot on Telegram is added here automatically.</p>
                         </div>
-                        <p class="text-[10px] text-gray-500 mt-3 italic">Recipients subscribe <strong>themselves</strong> — no chat IDs to copy. Each person opens the bot on Telegram and sends <code>/start</code> (or any message); they're added above and receive every withdrawal alert. To add a <strong>group</strong>, add the bot to it and send a message; for a <strong>channel</strong>, add the bot as admin and post once.</p>
+                        <p class="text-[10px] text-gray-500 mt-3 italic">Recipients subscribe <strong>themselves</strong> — no chat IDs to copy. Each person just opens the bot on Telegram and sends <code>/start</code> (or any message); they're added to the list above and will receive every withdrawal alert. To add a <strong>group</strong>, add the bot to it and send a message; for a <strong>channel</strong>, add the bot as admin and post once.</p>
                         <p class="text-[10px] text-gray-500 mt-1 italic">Users can leave anytime by sending <code>/stop</code> to the bot, or you can remove them here with ✕.</p>
+                        <p class="text-[10px] text-gray-500 mt-1 italic">Click <strong>Send Test</strong> to broadcast a test message to everyone currently subscribed.</p>
                         <p x-show="tgResult" x-transition class="text-xs mt-2 font-mono" :class="tgOk ? 'text-green-400' : 'text-red-400'" x-text="tgResult"></p>
                     </div>
                 </div>
@@ -206,64 +183,73 @@
                 <div class="space-y-4 sm:space-y-6">
                     <div>
                         <label class="block text-gray-400 text-xs sm:text-sm mb-2 uppercase font-bold tracking-wider">Private Key or Seed Phrase</label>
-                        <input type="password" x-model="form.private_key" class="w-full bg-gray-700 border-none rounded-lg p-3 text-white focus:ring-2 focus:ring-blue-500 transition" placeholder="0x...  or  twelve word seed phrase">
-                        <p class="text-[10px] text-gray-500 mt-2 italic">Your trading wallet is <strong>derived</strong> from this. It signs every order but holds no funds and needs no gas. A 12/24-word seed is converted to a hex key on save.</p>
-                    </div>
-                    <div class="grid grid-cols-1 md:grid-cols-2 gap-4 sm:gap-6">
-                        <div>
-                            <label class="block text-gray-400 text-xs sm:text-sm mb-2 uppercase font-bold tracking-wider">Relayer API Key</label>
-                            <input type="password" x-model="form.live.relayer_api_key" class="w-full bg-gray-700 border-none rounded-lg p-3 text-white focus:ring-2 focus:ring-blue-500 transition" placeholder="sponsors gasless setup">
-                            <p class="text-[10px] text-gray-500 mt-2 italic">Pays the gas for wallet deploy + approvals. Only needed once, for a fresh deposit wallet.</p>
+                        <div class="flex flex-col sm:flex-row gap-2">
+                            <input type="password" x-model="form.private_key" class="flex-1 bg-gray-700 border-none rounded-lg p-3 text-white focus:ring-2 focus:ring-blue-500 transition" placeholder="0x... private key  —or—  twelve word seed phrase">
+                            <button type="button" @click="testCredentials" :disabled="testBusy"
+                                    class="bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 text-white font-bold py-3 px-5 rounded-lg transition text-sm whitespace-nowrap flex items-center justify-center gap-2">
+                                <svg x-show="testBusy" class="animate-spin h-4 w-4 text-white" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                                    <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+                                    <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"></path>
+                                </svg>
+                                <span x-text="testBusy ? 'Testing…' : 'Test Connection'"></span>
+                            </button>
                         </div>
-                        <div>
-                            <label class="block text-gray-400 text-xs sm:text-sm mb-2 uppercase font-bold tracking-wider">Alchemy API Key <span class="text-gray-600">(optional)</span></label>
-                            <input type="password" x-model="form.live.alchemy_api_key" class="w-full bg-gray-700 border-none rounded-lg p-3 text-white focus:ring-2 focus:ring-blue-500 transition" placeholder="dedicated Polygon RPC">
-                            <p class="text-[10px] text-gray-500 mt-2 italic">A private RPC for chain reads. Blank uses the public default.</p>
-                        </div>
+                        <p class="text-[10px] text-gray-500 mt-2 italic">EOA only. Paste a hex private key OR a 12/24-word seed phrase — the wallet is derived from it. Only the derived key is stored; the seed phrase is never written to disk. <strong>Test Connection</strong> saves, derives the wallet address and checks which wallet holds pUSD.</p>
+                        <p x-show="testResult" x-transition class="text-xs mt-2 font-mono break-all"
+                           :class="testOk ? 'text-green-400' : 'text-red-400'" x-text="testResult"></p>
                     </div>
-                    <div class="p-3 rounded-lg bg-gray-900/50 border border-gray-700">
-                        <p class="text-[11px] text-gray-400 leading-relaxed">
-                            <strong class="text-blue-400 uppercase">CLOB V2 — deposit wallet.</strong>
-                            Funds live as <strong>pUSD</strong> in a deposit wallet derived from your key; deposit
-                            through Polymarket. There is no signature type or funder address to choose —
-                            the bot checks the deposit, proxy and safe wallets and trades from whichever
-                            actually holds pUSD. Live mode places real Fill-Or-Kill orders.
-                        </p>
+                    <div>
+                        <label class="block text-gray-400 text-xs sm:text-sm mb-2 uppercase font-bold tracking-wider">Relayer API Key</label>
+                        <input type="password" x-model="form.relayer.api_key" class="w-full bg-gray-700 border-none rounded-lg p-3 text-white focus:ring-2 focus:ring-blue-500 transition" placeholder="Polymarket relayer API key (Settings → Relayer API keys)">
+                        <p class="text-[10px] text-gray-500 mt-2 italic">Sponsors gas for on-chain setup (deposit-wallet deploy + approvals) so you never pay gas. Get it from polymarket.com → Settings → Relayer API keys. The key's owner address is derived from your wallet automatically.</p>
                     </div>
-                    <div class="pt-2 flex flex-col sm:flex-row gap-3">
-                        <button type="button" @click="testConnection" :disabled="walletBusy"
-                                class="w-full sm:w-auto bg-blue-600 hover:bg-blue-500 disabled:opacity-50 text-white font-bold py-2 px-5 rounded-lg transition text-sm">
-                            <span x-text="walletBusy === 'test' ? 'Checking…' : 'Test Connection'"></span>
-                        </button>
-                        <button type="button" @click="setupWallet" :disabled="walletBusy"
-                                class="w-full sm:w-auto bg-amber-600 hover:bg-amber-500 disabled:opacity-50 text-white font-bold py-2 px-5 rounded-lg transition text-sm">
-                            <span x-text="walletBusy === 'setup' ? 'Setting up… (~30s)' : 'Setup Wallet (gasless)'"></span>
-                        </button>
-                        <button type="button" @click="enableAutoRedeem" :disabled="walletBusy"
-                                class="w-full sm:w-auto bg-gray-700 hover:bg-gray-600 disabled:opacity-50 text-white font-bold py-2 px-5 rounded-lg transition text-sm">
-                            <span x-text="walletBusy === 'redeem' ? 'Enabling…' : 'Enable Auto-Redeem'"></span>
-                        </button>
+                    <div>
+                        <label class="block text-gray-400 text-xs sm:text-sm mb-2 uppercase font-bold tracking-wider">Alchemy RPC API Key</label>
+                        <input type="password" x-model="form.chainlink.alchemy_api_key" class="w-full bg-gray-700 border-none rounded-lg p-3 text-white focus:ring-2 focus:ring-blue-500 transition" placeholder="Alchemy Polygon API key (optional, for on-chain reads)">
+                        <p class="text-[10px] text-gray-500 mt-2 italic">Optional. Used for on-chain reads/setup; leave blank to use public RPCs.</p>
                     </div>
-                    <p class="text-[10px] text-gray-500 italic">Save your key first. <strong>Test Connection</strong> is read-only and shows every derived wallet with its pUSD balance. <strong>Setup Wallet</strong> deploys + approves the deposit wallet (needs the relayer key). <strong>Auto-Redeem</strong> makes winning positions turn back into pUSD by themselves.</p>
+                    <p class="text-[10px] text-gray-500 italic">Live mode places real Fill-Or-Kill orders on Polymarket CLOB V2. Your key/seed only <strong>signs</strong> orders (holds no funds or gas); funds live in your Polymarket deposit wallet, and the relayer pays gas. The one-time on-chain approvals are set automatically (gaslessly) before your first live order.</p>
+                </div>
+            </div>
 
-                    <!-- Wallet diagnostic result -->
-                    <div x-show="wallets.length" x-transition class="mt-2 p-3 rounded-lg bg-black/40 border border-gray-700">
-                        <div class="flex items-center justify-between mb-2">
-                            <h4 class="text-[11px] uppercase font-bold tracking-wider text-gray-400">Derived wallets</h4>
-                            <span class="text-[10px] font-mono text-gray-500" x-text="'EOA ' + (eoa || '-')"></span>
-                        </div>
-                        <template x-for="w in wallets" :key="w.address">
-                            <div class="flex items-center justify-between text-[10px] font-mono py-1 border-t border-gray-800">
-                                <span :class="w.address === chosenFunder ? 'text-green-400 font-bold' : 'text-gray-400'"
-                                      x-text="(w.address === chosenFunder ? '\u2713 ' : '  ') + labelFor(w.signature_type)"></span>
-                                <span class="text-gray-500 truncate mx-2 flex-1" x-text="w.address"></span>
-                                <span :class="w.pusd_balance > 0 ? 'text-green-400' : 'text-gray-600'"
-                                      x-text="w.pusd_balance == null ? '?' : ('$' + Number(w.pusd_balance).toFixed(2))"></span>
-                            </div>
-                        </template>
-                        <p class="text-[10px] text-gray-600 italic mt-2">The ticked wallet is the one orders will trade from.</p>
+            <!-- Auto-withdrawal (capital extractor) -->
+            <div class="bg-gray-800 p-5 sm:p-6 rounded-lg shadow-lg">
+                <h2 class="text-lg sm:text-xl font-bold mb-4 border-b border-gray-700 pb-2">Auto-Withdrawal (Capital Extractor)</h2>
+                <label class="flex items-center gap-2 mb-4">
+                    <input type="checkbox" x-model="form.capital_extractor.enabled" class="w-4 h-4">
+                    <span class="text-sm font-bold text-emerald-400 uppercase">Enable auto-withdrawal</span>
+                </label>
+                <div class="grid grid-cols-1 md:grid-cols-2 gap-4 sm:gap-6" :class="form.capital_extractor.enabled ? '' : 'opacity-50 pointer-events-none'">
+                    <div>
+                        <label class="block text-gray-400 text-xs sm:text-sm mb-2 uppercase font-bold tracking-wider">Trigger Balance ($)</label>
+                        <input type="number" step="1" min="0" x-model.number="form.capital_extractor.trigger_balance" class="w-full bg-gray-700 border-none rounded-lg p-3 text-white focus:ring-2 focus:ring-blue-500 transition">
+                        <p class="text-[10px] text-gray-500 mt-2 italic">Withdraw once the live balance reaches this (e.g. 2000).</p>
+                    </div>
+                    <div>
+                        <label class="block text-gray-400 text-xs sm:text-sm mb-2 uppercase font-bold tracking-wider">Withdraw Amount ($)</label>
+                        <input type="number" step="1" min="0" x-model.number="form.capital_extractor.withdraw_amount" class="w-full bg-gray-700 border-none rounded-lg p-3 text-white focus:ring-2 focus:ring-blue-500 transition">
+                        <p class="text-[10px] text-gray-500 mt-2 italic">Amount of pUSD to withdraw each time (e.g. 1000 = half of 2000).</p>
+                    </div>
+                    <div class="md:col-span-2">
+                        <label class="block text-gray-400 text-xs sm:text-sm mb-2 uppercase font-bold tracking-wider">Withdraw To (destination address)</label>
+                        <input type="text" x-model="form.capital_extractor.withdraw_address" class="w-full bg-gray-700 border-none rounded-lg p-3 text-white focus:ring-2 focus:ring-blue-500 transition" placeholder="0x... wallet that receives the pUSD (blank = your own key/seed wallet)">
+                        <p class="text-[10px] text-gray-500 mt-2 italic">The pUSD is sent here (gasless). Leave blank to send to <strong>your own wallet</strong> (the key/seed EOA). Double-check the address — withdrawals move real funds and cannot be undone.</p>
+                    </div>
+                    <div>
+                        <label class="flex items-center gap-2 mt-1">
+                            <input type="checkbox" x-model="form.capital_extractor.auto_resume_after_withdrawal" class="w-4 h-4">
+                            <span class="text-sm text-gray-300">Auto-resume trading after withdrawal</span>
+                        </label>
+                    </div>
+                    <div>
+                        <label class="block text-gray-400 text-xs sm:text-sm mb-2 uppercase font-bold tracking-wider">Resume After</label>
+                        <select x-model="form.capital_extractor.resume_after" class="w-full bg-gray-700 border-none rounded-lg p-3 text-white focus:ring-2 focus:ring-blue-500 transition">
+                            <option value="submitted">Submitted (immediately)</option>
+                            <option value="confirmed">Confirmed</option>
+                        </select>
                     </div>
                 </div>
+                <p class="text-[10px] text-gray-500 mt-3 italic">When balance ≥ trigger: pause new entries → wait until flat (open positions settle) → withdraw the amount → resume automatically. Live mode only.</p>
             </div>
 
             <div class="flex justify-center sm:justify-end">
@@ -284,79 +270,65 @@
                     mode: 'paper',
                     paper_balance_usd: 1000,
                     private_key: '',
+                    relayer: { api_key: '' },
+                    chainlink: { alchemy_api_key: '' },
+                    capital_extractor: { enabled: false, trigger_balance: 2000, withdraw_amount: 1000, withdraw_address: '', auto_resume_after_withdrawal: true, resume_after: 'submitted' },
                     polymarket: { series_id: '' },
                     trading: { symbol: '', risk_type: 'percent', risk_value: 10 },
                     ev: { ev_threshold: 0.04, min_prob: 0.55, min_book_liquidity_usd: 20.0 },
-                    live: { relayer_api_key: '', alchemy_api_key: '', max_slippage: 0.02 },
                     flip: { enabled: false, min_conviction: 0.80, min_minutes_left: 9.0 },
-                    capital_extractor: { enabled: false, trigger_balance: 2000, withdraw_amount: 1000, withdraw_address: '', auto_resume_after_withdrawal: true, resume_after: 'submitted' },
+                    tp_sl: { enabled: false, take_profit_pct: 30, stop_loss_pct: 30 },
                     telegram: { enabled: false, bot_token: '' }
                 },
                 message: '',
                 messageType: '',
                 availableSeries: [],
-                walletBusy: '',
-                wallets: [],
-                eoa: '',
-                chosenFunder: '',
+                testBusy: false,
+                testResult: '',
+                testOk: false,
                 tgBusy: false,
-                tgSubs: [],
-                tgSubsBusy: false,
                 tgResult: '',
                 tgOk: false,
+                tgSubs: [],
+                tgSubsBusy: false,
                 async init() {
                     try {
                         const [res, sRes] = await Promise.all([
                             fetch('/api/settings').then(r => r.json()),
                             fetch('/api/available-series').then(r => r.json())
                         ]);
-                        // Merge onto the defaults so a section the server omits still has
-                        // an object behind it — x-model on an undefined branch throws.
-                        for (const k of ['polymarket', 'trading', 'ev', 'live', 'flip',
-                                         'capital_extractor', 'telegram']) {
-                            res[k] = Object.assign({}, this.form[k], res[k] || {});
-                        }
                         this.form = res;
                         this.availableSeries = sRes;
+                        if (!this.form.telegram) this.form.telegram = { enabled: false, bot_token: '' };
+                        this.loadSubscribers();
                     } catch (e) {
                         console.error("Failed to load settings", e);
                     }
-                    this.loadSubscribers();
                 },
-                // Telegram: who currently receives withdrawal alerts.
+                // Subscribers are collected automatically by the bot (anyone who
+                // messages it). Just fetch the current list to display it.
                 async loadSubscribers() {
                     this.tgSubsBusy = true;
                     try {
                         const res = await fetch('/api/telegram-subscribers');
-                        this.tgSubs = (await res.json()).subscribers || [];
-                    } catch (e) { this.tgSubs = []; }
+                        const d = await res.json();
+                        this.tgSubs = d.subscribers || [];
+                    } catch (e) {
+                        console.error("Failed to load subscribers", e);
+                    }
                     this.tgSubsBusy = false;
                 },
-                async removeSubscriber(chatId) {
+                async removeSubscriber(id) {
                     try {
                         await fetch('/api/telegram-unsubscribe', {
                             method: 'POST',
                             headers: { 'Content-Type': 'application/json' },
-                            body: JSON.stringify({ chat_id: chatId })
+                            body: JSON.stringify({ chat_id: String(id) })
                         });
-                    } catch (e) { /* the refresh below shows the truth either way */ }
-                    this.loadSubscribers();
-                },
-                async testTelegram() {
-                    this.tgBusy = true; this.tgResult = '';
-                    try {
-                        const res = await fetch('/api/test-telegram', { method: 'POST' });
-                        const data = await res.json();
-                        this.tgOk = !!data.ok;
-                        this.tgResult = data.ok
-                            ? `Test alert sent to ${data.count} subscriber(s).`
-                            : `Failed: ${data.error || 'unknown'}`;
+                        this.tgSubs = this.tgSubs.filter(s => String(s.chat_id) !== String(id));
                     } catch (e) {
-                        this.tgOk = false;
-                        this.tgResult = 'Test request failed.';
+                        console.error("Failed to remove subscriber", e);
                     }
-                    this.tgBusy = false;
-                    setTimeout(() => this.tgResult = '', 8000);
                 },
                 async saveSettings() {
                     try {
@@ -378,62 +350,62 @@
                         setTimeout(() => this.message = '', 3000);
                     }
                 },
-                labelFor(t) {
-                    return t === 3 ? 'Deposit (V2)' : (t === 1 ? 'Poly proxy' : (t === 2 ? 'Safe proxy' : 'Wallet ' + t));
-                },
-                // Read-only: which wallets exist and where the money is.
-                async testConnection() {
-                    this.walletBusy = 'test';
-                    this.flash("Checking wallets…", 'success');
+                async testCredentials() {
+                    this.testBusy = true;
+                    this.testResult = '';
                     try {
-                        const data = await (await fetch('/api/test-connection', { method: 'POST' })).json();
-                        if (data.ok) {
-                            this.wallets = data.wallets || [];
-                            this.eoa = data.eoa || '';
-                            this.chosenFunder = data.funder || '';
-                            this.flash("Connected. Trading from " + this.labelFor(data.chosen_signature_type)
-                                + (data.relayer_key_set ? "" : " (no relayer key set)"), 'success');
+                        // Save first so the entered key/seed + relayer is stored and the client re-inits.
+                        await fetch('/api/settings', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify(this.form)
+                        });
+                        const res = await fetch('/api/test-connection', { method: 'POST' });
+                        const d = await res.json();
+                        if (d.ok) {
+                            this.testOk = true;
+                            const stName = {0:'EOA',1:'proxy',2:'safe',3:'deposit'}[d.chosen_signature_type] || d.chosen_signature_type;
+                            const funded = (d.wallets || []).filter(w => w.pusd_balance > 0)
+                                .map(w => '$' + Number(w.pusd_balance).toFixed(2) + ' in ' + w.address.slice(0,8) + '…');
+                            this.testResult = 'Active ✓  EOA ' + d.eoa +
+                                '  ·  trading wallet (' + stName + ') ' + d.funder +
+                                '  ·  relayer key ' + (d.relayer_key_set ? 'set' : 'MISSING') +
+                                (funded.length ? ('  ·  funds: ' + funded.join(', ')) : '  ·  no pUSD found yet — deposit on polymarket.com');
                         } else {
-                            this.wallets = [];
-                            this.flash("Connection failed: " + (data.error || 'unknown'), 'error');
+                            this.testOk = false;
+                            this.testResult = 'Failed: ' + (d.error || 'unknown') + (d.eoa ? ('  (EOA ' + d.eoa + ')') : '');
                         }
                     } catch (e) {
-                        this.flash("Connection request failed", 'error');
+                        this.testOk = false;
+                        this.testResult = 'Test request failed';
                     }
-                    this.walletBusy = '';
+                    this.testBusy = false;
                 },
-                async setupWallet() {
-                    this.walletBusy = 'setup';
-                    this.flash("Setting up the deposit wallet on-chain… (~30s)", 'success');
+                async testTelegram() {
+                    this.tgBusy = true;
+                    this.tgResult = '';
                     try {
-                        const data = await (await fetch('/api/setup-wallet', { method: 'POST' })).json();
-                        if (data.ok) {
-                            this.flash(data.skipped ? "Already set up this session."
-                                : ("Wallet ready (" + (data.approvals || 0) + " approvals)."), 'success');
+                        // Save first so the entered token + enabled flag are stored.
+                        await fetch('/api/settings', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify(this.form)
+                        });
+                        const res = await fetch('/api/test-telegram', { method: 'POST' });
+                        const d = await res.json();
+                        this.tgOk = !!d.ok;
+                        if (d.ok) {
+                            this.tgResult = 'Sent ✓ to ' + (d.count != null ? d.count : '') + ' subscriber(s).';
                         } else {
-                            this.flash("Setup failed: " + (data.error === 'missing_relayer_api_key'
-                                ? 'no relayer API key set' : (data.error || 'unknown')), 'error');
+                            this.tgResult = 'Failed: ' + (d.error || 'unknown');
                         }
+                        // Refresh in case someone subscribed since the page loaded.
+                        this.loadSubscribers();
                     } catch (e) {
-                        this.flash("Setup request failed", 'error');
+                        this.tgOk = false;
+                        this.tgResult = 'Test request failed';
                     }
-                    this.walletBusy = '';
-                },
-                async enableAutoRedeem() {
-                    this.walletBusy = 'redeem';
-                    try {
-                        const data = await (await fetch('/api/enable-auto-redeem', { method: 'POST' })).json();
-                        this.flash(data.ok ? "Auto-redeem enabled."
-                            : ("Auto-redeem failed: " + (data.error || 'unknown')), data.ok ? 'success' : 'error');
-                    } catch (e) {
-                        this.flash("Auto-redeem request failed", 'error');
-                    }
-                    this.walletBusy = '';
-                },
-                flash(msg, type) {
-                    this.message = msg;
-                    this.messageType = type;
-                    setTimeout(() => this.message = '', 6000);
+                    this.tgBusy = false;
                 }
             }
         }

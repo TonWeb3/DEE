@@ -10,14 +10,15 @@ from typing import Dict, Any
 #
 #  The decision is purely a fast fair probability (from Binance spot) vs the
 #  market's implied price. Enter when the gap (expected value) is large enough
-#  that the book looks stale. RSI and Heiken-Ashi survive only as veto filters.
+#  that the book looks stale. There are no other filters.
 # ─────────────────────────────────────────────────────────────────────────────
 
-EXHAUSTION_BARS = 6  # a Heiken-Ashi streak this long is over-extended → veto chasing it
 
-
-def _no_ev(reason: str) -> Dict[str, Any]:
-    return {"action": "NO_TRADE", "side": None, "phase": "EV", "strength": "EV", "reason": reason}
+def _no_ev(reason: str, side=None, prob=None, price=None, ev=None) -> Dict[str, Any]:
+    # Carry the chosen side's prob/price/ev even on a no-trade so every tick can be
+    # logged and mined for filters later.
+    return {"action": "NO_TRADE", "side": side, "phase": "EV", "strength": "EV",
+            "reason": reason, "prob": prob, "price": price, "ev": ev}
 
 
 def decide_ev(inputs: Dict[str, Any]) -> Dict[str, Any]:
@@ -25,7 +26,6 @@ def decide_ev(inputs: Dict[str, Any]) -> Dict[str, Any]:
 
     EV_side = p_side - ask_price_side. A positive EV beyond `evThreshold` means the
     book is underpricing the side our fast feed already favours — the latency edge.
-    RSI / Heiken-Ashi are veto filters only; they do NOT distort the probability.
     Position sizing (percent/fixed of balance) is handled by the caller.
     """
     p_up = inputs.get("mcProbUp")
@@ -49,24 +49,11 @@ def decide_ev(inputs: Dict[str, Any]) -> Dict[str, Any]:
     min_prob = inputs.get("minProb", 0.55)
     ev_threshold = inputs.get("evThreshold", 0.04)
 
-    # ── VETO filters — never chase a stretched move or trade into RSI extremes ──
-    if side == "UP" and inputs.get("haExhaustedGreen"):
-        return _no_ev("ha_exhausted_up")
-    if side == "DOWN" and inputs.get("haExhaustedRed"):
-        return _no_ev("ha_exhausted_down")
-
-    rsi = inputs.get("rsi")
-    if rsi is not None:
-        if side == "UP" and rsi > 70:
-            return _no_ev("rsi_overbought")
-        if side == "DOWN" and rsi < 30:
-            return _no_ev("rsi_oversold")
-
     # ── GATES ──
     if p < min_prob:
-        return _no_ev(f"prob_{p:.2f}_below_{min_prob:.2f}")
+        return _no_ev(f"prob_{p:.2f}_below_{min_prob:.2f}", side, p, price, ev)
     if ev < ev_threshold:
-        return _no_ev(f"ev_{ev:.3f}_below_{ev_threshold:.3f}")
+        return _no_ev(f"ev_{ev:.3f}_below_{ev_threshold:.3f}", side, p, price, ev)
 
     strength = "HIGH_CONVICTION" if p >= 0.70 else "STRONG"
     return {

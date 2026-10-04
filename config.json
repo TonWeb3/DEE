@@ -1,11 +1,7 @@
 {
   "mode": "paper",
-  "paper_balance_usd": 1000.0,
+  "paper_balance_usd": 1000,
   "private_key": "",
-  "live": {
-    "max_slippage": 0.02,
-    "exit_max_retries": 3
-  },
   "relayer": {
     "api_key": ""
   },
@@ -17,16 +13,10 @@
     "auto_resume_after_withdrawal": true,
     "resume_after": "submitted"
   },
-  "telegram": {
-    "enabled": false,
-    "bot_token": ""
-  },
   "polymarket": {
     "gamma_base_url": "https://gamma-api.polymarket.com",
     "clob_base_url": "https://clob.polymarket.com",
     "live_ws_url": "wss://ws-live-data.polymarket.com",
-    "clob_ws_url": "wss://ws-subscriptions-clob.polymarket.com/ws/market",
-    "max_book_age_s": 15,
     "series_id": "10192",
     "series_slug": "btc-up-or-down-15m",
     "auto_select_latest": true,
@@ -46,13 +36,19 @@
     "min_prob": 0.55,
     "min_book_liquidity_usd": 20
   },
-  "settlement": {
-    "authoritative_settle_wait_s": 90
-  },
   "flip": {
     "enabled": false,
     "min_conviction": 0.65,
     "min_minutes_left": 4
+  },
+  "tp_sl": {
+    "enabled": false,
+    "take_profit_pct": 30,
+    "stop_loss_pct": 30
+  },
+  "telegram": {
+    "enabled": false,
+    "bot_token": ""
   },
   "chainlink": {
     "polygon_rpc_url": "https://polygon.drpc.org",

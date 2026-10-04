@@ -11,8 +11,7 @@ Polymarket migrated to CLOB V2. New wallets trade through the gasless
 
 Legacy accounts (Polymarket proxy / Gnosis safe) are auto-detected and used as-is:
 we pick whichever wallet actually holds pUSD. The EOA is derived from PRIVATE_KEY
-(hex key or 12/24-word seed phrase), so there is no signature-type/funder to choose
-by hand any more.
+(hex key or 12/24-word seed phrase).
 
 All clients are synchronous — call from the event loop via `asyncio.to_thread`.
 """
@@ -20,15 +19,6 @@ All clients are synchronous — call from the event loop via `asyncio.to_thread`
 import threading
 from typing import Optional, Dict, Any, List, Tuple
 from .config import settings
-
-
-def _to_float(x) -> Optional[float]:
-    try:
-        if x is None:
-            return None
-        return float(x)
-    except (TypeError, ValueError):
-        return None
 
 
 def _patch_clob_models():
@@ -198,14 +188,6 @@ class ClobTrader:
             return {"ok": False, "error": f"{type(e).__name__}: {e}"}
 
     # ── orders ──────────────────────────────────────────────────────────────────
-    # A Fill-Or-Kill order either fills completely or is KILLED. The old success test
-    # was `resp.get("success") is not False`, so a KILLED order was recorded as a
-    # filled position — a phantom trade with no fill behind it, and `shares` was always
-    # the estimate stake/quote rather than what was actually bought. Now a fill must be
-    # positively proven: success is true, the status says matched/delayed, AND non-zero
-    # amounts are reported on both legs. Anything else is a failure.
-    _FILLED_STATUSES = ("matched", "delayed")
-
     def _market_order(self, token_id, amount, side: str, price) -> Dict[str, Any]:
         from polymarket_apis.types.clob_types import MarketOrderArgs, OrderType
         args = MarketOrderArgs(
@@ -216,56 +198,25 @@ class ClobTrader:
             order_type=OrderType.FOK,
         )
         resp = self.clob.create_and_post_market_order(args)
-        if resp is None:
-            return {"ok": False, "error": "no_response_from_clob", "response": {}}
-
-        data = resp.model_dump() if hasattr(resp, "model_dump") else dict(resp)
-        order_id = (data.get("order_id") or data.get("orderID")
-                    or data.get("orderId") or data.get("id"))
-        status = str(data.get("status", "")).lower()
-        err = data.get("error_msg") or data.get("errorMsg")
-
-        # making/taking are the two legs of the match:
-        #   BUY  -> making = USDC paid,   taking = shares received
-        #   SELL -> making = shares sold, taking = USDC received
-        making = _to_float(data.get("making_amount") or data.get("makingAmount"))
-        taking = _to_float(data.get("taking_amount") or data.get("takingAmount"))
-
-        if side == "BUY":
-            usd, shares = making, taking
-        else:
-            shares, usd = making, taking
-
-        filled = (data.get("success") is not False
-                  and status in self._FILLED_STATUSES
-                  and shares is not None and shares > 0
-                  and usd is not None and usd > 0)
-
-        if not filled:
-            return {"ok": False, "response": data, "order_id": order_id,
-                    "status": status,
-                    "error": err or f"not_filled(status={status or 'unknown'})"}
-
-        return {
-            "ok": True, "response": data, "order_id": order_id, "status": status,
-            # REAL fill economics — never the quote we asked for. A FOK can fill
-            # anywhere up to the limit, so shares != amount/quote.
-            "fill_price": (usd / shares) if shares else None,
-            "fill_size": shares,
-            "fill_usd": usd,
-        }
+        data = resp.model_dump() if hasattr(resp, "model_dump") else (resp or {})
+        order_id = None
+        success = resp is not None
+        if isinstance(data, dict):
+            order_id = data.get("order_id") or data.get("orderID") or data.get("orderId") or data.get("id")
+            if data.get("success") is False:
+                success = False
+            if str(data.get("status", "")).lower() in ("matched", "live", "delayed"):
+                success = True
+        return {"ok": success, "response": data, "order_id": order_id}
 
     def place_market_buy(self, token_id: str, usdc_amount: float, price: Optional[float] = None) -> Dict[str, Any]:
         """Fill-Or-Kill marketable BUY for `usdc_amount` USDC of `token_id`. `price`
-        is the current quote; the limit is quote + slippage buffer (capped < $1).
-        On success returns the ACTUAL fill_price / fill_size / fill_usd."""
+        is the current quote; the limit is quote + slippage buffer (capped < $1)."""
         if not token_id:
             return {"ok": False, "error": "missing_token_id"}
         if not self.ensure_ready():
             return {"ok": False, "error": self.last_error or "client_not_ready"}
         # Ensure the deposit wallet is deployed + approved before the first order.
-        # A missing relayer key is tolerated: an already-set-up wallet trades fine
-        # without one, and a fresh wallet will simply fail at the order instead.
         setup = self.ensure_setup()
         if not setup.get("ok") and setup.get("error") != "missing_relayer_api_key":
             return {"ok": False, "error": f"setup_failed: {setup.get('error')}"}
@@ -277,8 +228,7 @@ class ClobTrader:
 
     def place_market_sell(self, token_id: str, size: float, price: Optional[float] = None) -> Dict[str, Any]:
         """Fill-Or-Kill marketable SELL of `size` shares (used to exit / flip). Limit
-        is quote − slippage buffer (floored at 1¢). On success returns the ACTUAL
-        fill_price / fill_size / fill_usd."""
+        is quote − slippage buffer (floored at 1¢)."""
         if not token_id:
             return {"ok": False, "error": "missing_token_id"}
         if not self.ensure_ready():
@@ -289,66 +239,18 @@ class ClobTrader:
         except Exception as e:
             return {"ok": False, "error": f"{type(e).__name__}: {e}"}
 
-    def get_last_fill(self, token_id: str) -> Optional[Dict[str, Any]]:
-        """Most recent on-chain trade for this token from the CLOB's own record —
-        an independent confirmation that a reported fill really happened."""
-        if not self.ensure_ready():
+    # ── withdrawal (auto capital extractor) ─────────────────────────────────────
+    def get_eoa_address(self) -> Optional[str]:
+        """The EOA address derived from PRIVATE_KEY — the wallet you control (the
+        key/seed owner). Default destination for auto-withdrawals."""
+        if not settings.PRIVATE_KEY:
             return None
         try:
-            trades = self.clob.get_trades(token_id=str(token_id))
+            from eth_account import Account
+            return Account.from_key(settings.PRIVATE_KEY).address
         except Exception:
             return None
-        if not trades:
-            return None
-        t = trades[0]
-        d = t.model_dump() if hasattr(t, "model_dump") else dict(t)
-        return {"trade_id": d.get("trade_id"), "side": d.get("side"),
-                "price": _to_float(d.get("price")), "size": _to_float(d.get("size")),
-                "status": d.get("status"), "match_time": d.get("match_time")}
 
-    # ── redemption ──────────────────────────────────────────────────────────────
-    # A winning position does NOT become spendable money on its own: it stays a CTF
-    # conditional token worth $1 that must be redeemed. Without this, live wins never
-    # show up in the pUSD balance and capital quietly strands — `get_pusd_balance`
-    # reads pUSD only and cannot see them.
-    #
-    # NOTE: redeem_position / auto_redeem_enable live on the GASLESS WEB3 client, not
-    # on the CLOB client. (The build this was ported from reached for a `self.client`
-    # attribute that does not exist, so both methods were dead there.)
-
-    def enable_auto_redeem(self) -> Dict[str, Any]:
-        """Ask Polymarket to auto-redeem resolved positions. Best-effort: if the
-        account doesn't support it we fall back to redeeming explicitly."""
-        if not self.ensure_ready():
-            return {"ok": False, "error": self.last_error or "client_not_ready"}
-        if not hasattr(self.gasless, "auto_redeem_enable"):
-            return {"ok": False, "error": "auto_redeem_unsupported"}
-        try:
-            res = self.gasless.auto_redeem_enable()
-            return {"ok": True, "result": str(res)}
-        except Exception as e:
-            return {"ok": False, "error": f"{type(e).__name__}: {e}"}
-
-    def redeem(self, condition_id: str, amounts, neg_risk: bool = False) -> Dict[str, Any]:
-        """Redeem a resolved position into pUSD.
-
-        `amounts` is the per-outcome share list the CTF expects ([up, down]); the
-        losing leg is simply zero.
-        """
-        if not condition_id:
-            return {"ok": False, "error": "missing_condition_id"}
-        if not self.ensure_ready():
-            return {"ok": False, "error": self.last_error or "client_not_ready"}
-        if not hasattr(self.gasless, "redeem_position"):
-            return {"ok": False, "error": "redeem_unsupported_by_client"}
-        try:
-            amts = [float(a) for a in (amounts if isinstance(amounts, (list, tuple)) else [amounts])]
-            tx = self.gasless.redeem_position(condition_id, amts, neg_risk)
-            return {"ok": True, "tx": str(tx)}
-        except Exception as e:
-            return {"ok": False, "error": f"{type(e).__name__}: {e}"}
-
-    # ── withdrawal (auto capital extractor) ─────────────────────────────────────
     def withdraw_pusd(self, recipient: str, amount: float) -> Dict[str, Any]:
         """Transfer `amount` pUSD from the funded (deposit) wallet to `recipient`.
         Gasless via the relayer. Used by the auto-withdrawal state machine."""
@@ -358,8 +260,6 @@ class ClobTrader:
             return {"ok": False, "error": "invalid_amount"}
         if not self.ensure_ready():
             return {"ok": False, "error": self.last_error or "client_not_ready"}
-        if not hasattr(self.gasless, "transfer_pusd"):
-            return {"ok": False, "error": "withdraw_unsupported_by_client"}
         try:
             try:
                 from eth_utils import to_checksum_address
@@ -377,36 +277,7 @@ class ClobTrader:
         except Exception as e:
             return {"ok": False, "error": f"{type(e).__name__}: {e}"}
 
-    def is_tx_confirmed(self, tx_hash: str) -> Optional[bool]:
-        """True/False once the receipt is readable, None while still unknown. Used by
-        the capital extractor when `resume_after` is set to `confirmed`."""
-        if not tx_hash:
-            return None
-        try:
-            from web3 import Web3
-            rpc = settings.alchemy_rpc_url() or settings.POLYGON_RPC_URL
-            if not rpc:
-                return None
-            w3 = Web3(Web3.HTTPProvider(rpc, request_kwargs={"timeout": 6.0}))
-            receipt = w3.eth.get_transaction_receipt(tx_hash)
-            if receipt is None:
-                return None
-            return bool(receipt.get("status", 0) == 1)
-        except Exception:
-            return None
-
     # ── diagnostics / balance ───────────────────────────────────────────────────
-    def get_eoa_address(self) -> Optional[str]:
-        """The EOA address derived from PRIVATE_KEY — the wallet you control (the
-        key/seed owner). It signs orders but holds no funds or gas."""
-        if not settings.PRIVATE_KEY:
-            return None
-        try:
-            from eth_account import Account
-            return Account.from_key(settings.PRIVATE_KEY).address
-        except Exception:
-            return None
-
     def test_connection(self) -> Dict[str, Any]:
         """Derive the EOA + its candidate wallets and report pUSD balances — shows
         which wallet holds the funds and which signature type will be used. Read-only

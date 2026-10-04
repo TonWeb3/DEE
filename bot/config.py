@@ -1,41 +1,39 @@
 import os
 import json
 from pydantic_settings import BaseSettings, SettingsConfigDict
-from typing import List, Dict
+from typing import List, Dict, Any, Optional
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file='.env', env_file_encoding='utf-8', extra='ignore')
 
     MODE: str = "paper"  # "paper" or "live"
     PAPER_BALANCE_USD: float = 1000.0
-    PRIVATE_KEY: str = ""
+    PRIVATE_KEY: str = ""  # hex private key, or derived from a 12/24-word seed phrase
 
-    # ── Live trading (Polymarket CLOB V2) ───────────────────────────────────────
-    # The wallet is DERIVED from PRIVATE_KEY (hex key or 12/24-word seed phrase) and
-    # auto-detected: deposit-wallet (V2, signature_type 3) first, then legacy proxy /
-    # safe — whichever actually holds pUSD. Nothing to pick by hand.
+    # Live trading (Polymarket CLOB V2). The wallet is derived from PRIVATE_KEY (hex
+    # key or seed phrase). New wallets trade via the gasless deposit-wallet flow
+    # (POLY_1271); the relayer key sponsors on-chain setup (deploy/approvals).
     CLOB_MAX_SLIPPAGE: float = 0.02  # marketable-limit buffer above the quote (probability units)
-    RELAYER_API_KEY: str = ""        # Polymarket relayer API key (sponsors gasless on-chain setup)
-    ALCHEMY_API_KEY: str = ""        # optional: dedicated Polygon RPC for chain reads
-    EXIT_MAX_RETRIES: int = 3        # bounded retries for a failed early-exit sell
+    RELAYER_API_KEY: str = ""        # Polymarket relayer API key (gasless on-chain txs)
 
     # ── Auto-withdrawal (capital extractor) ─────────────────────────────────────
-    # LIVE mode only. Once equity (cash + open position value) reaches the trigger,
-    # pause entries, close any open trade, withdraw AMOUNT of pUSD to your own wallet
-    # (the key/seed EOA unless an address is set) and auto-resume next window.
+    # When the live balance reaches TRIGGER, pause entries, wait until flat, then
+    # withdraw AMOUNT of pUSD to your own wallet (the key/seed EOA) and auto-resume.
     AUTO_WITHDRAW_ENABLED: bool = False
-    WITHDRAW_TRIGGER_BALANCE: float = 2000.0  # withdraw once equity reaches this
+    WITHDRAW_TRIGGER_BALANCE: float = 2000.0  # withdraw once balance reaches this
     WITHDRAW_AMOUNT: float = 1000.0           # amount of pUSD to withdraw each time
-    WITHDRAW_ADDRESS: str = ""                # destination (blank = your own key/seed EOA)
+    WITHDRAW_ADDRESS: str = ""                # destination wallet (blank = your own key/seed EOA)
     WITHDRAW_AUTO_RESUME: bool = True         # resume trading after the withdrawal
     WITHDRAW_RESUME_AFTER: str = "submitted"  # "submitted" or "confirmed"
 
     # ── Telegram alerts ─────────────────────────────────────────────────────────
-    # When enabled, a message is broadcast every time a withdrawal completes. Anyone
-    # who sends the bot /start (or any message) is saved to telegram_subscribers.json
-    # and receives every alert — no chat IDs to copy by hand.
+    # When enabled, a message is sent to your Telegram bot every time a withdrawal
+    # happens (with the time and amount).
     TELEGRAM_ENABLED: bool = False
     TELEGRAM_BOT_TOKEN: str = ""   # from @BotFather
+    # No manual chat id: recipients are collected automatically. Anyone who sends the
+    # bot /start (or any message) is saved to telegram_subscribers.json, and every
+    # withdrawal alert is broadcast to all of them.
 
     SYMBOL: str = "BTCUSDT"
     BINANCE_BASE_URL: str = "https://api.binance.com"
@@ -56,17 +54,18 @@ class Settings(BaseSettings):
     MIN_PROB_EV: float = 0.55           # don't bet near-coinflips even if EV looks positive
     MIN_BOOK_LIQUIDITY_USD: float = 20.0  # skip if the ask side can't absorb the stake
 
-    # After a window expires, wait this long for Polymarket to publish its OFFICIAL
-    # outcome before falling back to our own close-vs-open comparison. Without this the
-    # local fallback always won the race and the authoritative result was never used.
-    AUTHORITATIVE_SETTLE_WAIT_S: float = 90.0
-
     # Close-and-flip the open position on a strong opposite signal
     FLIP_ENABLED: bool = False
     FLIP_MIN_CONVICTION: float = 0.80   # opposite side's adjusted prob must be >= this
     FLIP_MIN_MINUTES_LEFT: float = 9.0  # and at least this much time left in the window
 
-    RSI_PERIOD: int = 14
+    # ── Take-profit / stop-loss (early exit) ────────────────────────────────────
+    # Close the open position early when its unrealized P/L reaches +TAKE_PROFIT_PCT
+    # or -STOP_LOSS_PCT of the stake (the amount risked on the trade). After it fires,
+    # we don't re-enter until the next 15m window. Percentages (30 = 30%).
+    TP_SL_ENABLED: bool = False
+    TAKE_PROFIT_PCT: float = 30.0       # sell if position value is up this % vs the stake
+    STOP_LOSS_PCT: float = 30.0         # sell if position value is down this % vs the stake
 
     # Polymarket
     POLYMARKET_SLUG: str = os.getenv("POLYMARKET_SLUG", "")
@@ -74,11 +73,6 @@ class Settings(BaseSettings):
     POLYMARKET_SERIES_SLUG: str = os.getenv("POLYMARKET_SERIES_SLUG", "btc-up-or-down-15m")
     POLYMARKET_AUTO_SELECT_LATEST: bool = os.getenv("POLYMARKET_AUTO_SELECT_LATEST", "true").lower() == "true"
     POLYMARKET_LIVE_DATA_WS_URL: str = os.getenv("POLYMARKET_LIVE_WS_URL", "wss://ws-live-data.polymarket.com")
-    # CLOB market websocket — live order books for the active tokens, replacing the
-    # per-tick REST /book + /price poll. Set MAX_BOOK_AGE_S to 0 to disable the WS book
-    # entirely and go back to pure REST.
-    POLYMARKET_CLOB_WS_URL: str = os.getenv("POLYMARKET_CLOB_WS_URL", "wss://ws-subscriptions-clob.polymarket.com/ws/market")
-    MAX_BOOK_AGE_S: float = 15.0   # older than this => distrust the socket, use REST
     POLYMARKET_UP_LABEL: str = os.getenv("POLYMARKET_UP_LABEL", "Up")
     POLYMARKET_DOWN_LABEL: str = os.getenv("POLYMARKET_DOWN_LABEL", "Down")
 
@@ -89,6 +83,9 @@ class Settings(BaseSettings):
     POLYGON_WSS_URLS: List[str] = [url.strip() for url in os.getenv("POLYGON_WSS_URLS", "").split(",") if url.strip()]
     CHAINLINK_BTC_USD_AGGREGATOR: str = os.getenv("CHAINLINK_BTC_USD_AGGREGATOR", "0xc907E116054Ad103354f2D350FD2514433D57F6f")
 
+    # Alchemy — Polygon RPC used for the on-chain live-trading path (reads/setup).
+    ALCHEMY_API_KEY: str = os.getenv("ALCHEMY_API_KEY", "")
+
     CHAINLINK_AGGREGATORS: Dict[str, str] = {
         "BTC": "0xc907E116054Ad103354f2D350FD2514433D57F6f",
         "ETH": "0xF9680D99D6C9589e2a93a78A04A279e509205945",
@@ -98,15 +95,14 @@ class Settings(BaseSettings):
         "BNB": "0x82a6C67606bdc0409f959f60608226064223A57c"
     }
 
-    def alchemy_rpc_url(self) -> str:
-        """Dedicated Polygon RPC for chain reads (pUSD balance, wallet derivation).
-        Empty string => the library's default public RPC."""
-        return f"https://polygon-mainnet.g.alchemy.com/v2/{self.ALCHEMY_API_KEY}" if self.ALCHEMY_API_KEY else ""
-
     def get_aggregator(self, symbol: str) -> str:
         s = symbol.upper()
         if s.endswith("USDT"): s = s[:-4]
         return self.CHAINLINK_AGGREGATORS.get(s, self.CHAINLINK_BTC_USD_AGGREGATOR)
+
+    def alchemy_rpc_url(self) -> str:
+        # Polygon RPC used by the live-trading (gasless) path when a key is set.
+        return f"https://polygon-mainnet.g.alchemy.com/v2/{self.ALCHEMY_API_KEY}" if self.ALCHEMY_API_KEY else ""
 
     # Proxy
     HTTP_PROXY: str = os.getenv("HTTP_PROXY", os.getenv("http_proxy", ""))
@@ -115,8 +111,8 @@ class Settings(BaseSettings):
 
 def normalize_private_key(secret: str) -> str:
     """Accept either a raw hex private key or a 12/24-word seed phrase and return a
-    hex private key. EOA only — the trading wallet is derived from this secret and
-    nothing else. Returns "" for empty input. Raises if a seed phrase can't be parsed."""
+    hex private key. EOA only — the wallet is derived from the secret, nothing else.
+    Returns "" for empty input. Raises if a seed phrase can't be parsed."""
     secret = (secret or "").strip()
     if not secret:
         return ""
@@ -124,10 +120,7 @@ def normalize_private_key(secret: str) -> str:
     if len(secret.split()) >= 12:
         from eth_account import Account
         Account.enable_unaudited_hdwallet_features()
-        key = Account.from_mnemonic(secret).key.hex()
-        # hexbytes >= 1.0 returns bare hex; older returns it 0x-prefixed. Normalise so
-        # a derived key looks exactly like a pasted one downstream.
-        return key if key.startswith("0x") else "0x" + key
+        return Account.from_mnemonic(secret).key.hex()
     return secret
 
 
@@ -141,17 +134,11 @@ def load_settings():
 
             if "mode" in config_data: base_settings.MODE = config_data["mode"]
             if "paper_balance_usd" in config_data: base_settings.PAPER_BALANCE_USD = config_data["paper_balance_usd"]
-            if "private_key" in config_data:
-                base_settings.PRIVATE_KEY = normalize_private_key(config_data["private_key"])
+            if "private_key" in config_data: base_settings.PRIVATE_KEY = normalize_private_key(config_data["private_key"])
 
             if "relayer" in config_data:
                 rl = config_data["relayer"]
                 if "api_key" in rl: base_settings.RELAYER_API_KEY = rl["api_key"]
-
-            if "live" in config_data:
-                live = config_data["live"]
-                if "max_slippage" in live: base_settings.CLOB_MAX_SLIPPAGE = float(live["max_slippage"])
-                if "exit_max_retries" in live: base_settings.EXIT_MAX_RETRIES = int(live["exit_max_retries"])
 
             if "capital_extractor" in config_data:
                 ce = config_data["capital_extractor"]
@@ -162,18 +149,11 @@ def load_settings():
                 if "auto_resume_after_withdrawal" in ce: base_settings.WITHDRAW_AUTO_RESUME = bool(ce["auto_resume_after_withdrawal"])
                 if "resume_after" in ce: base_settings.WITHDRAW_RESUME_AFTER = ce["resume_after"]
 
-            if "telegram" in config_data:
-                tg = config_data["telegram"]
-                if "enabled" in tg: base_settings.TELEGRAM_ENABLED = bool(tg["enabled"])
-                if "bot_token" in tg: base_settings.TELEGRAM_BOT_TOKEN = tg["bot_token"]
-
             if "polymarket" in config_data:
                 poly = config_data["polymarket"]
                 if "gamma_base_url" in poly: base_settings.GAMMA_BASE_URL = poly["gamma_base_url"]
                 if "clob_base_url" in poly: base_settings.CLOB_BASE_URL = poly["clob_base_url"]
                 if "live_ws_url" in poly: base_settings.POLYMARKET_LIVE_DATA_WS_URL = poly["live_ws_url"]
-                if "clob_ws_url" in poly: base_settings.POLYMARKET_CLOB_WS_URL = poly["clob_ws_url"]
-                if "max_book_age_s" in poly: base_settings.MAX_BOOK_AGE_S = float(poly["max_book_age_s"])
                 if "series_id" in poly: base_settings.POLYMARKET_SERIES_ID = poly["series_id"]
                 if "series_slug" in poly: base_settings.POLYMARKET_SERIES_SLUG = poly["series_slug"]
                 if "auto_select_latest" in poly: base_settings.POLYMARKET_AUTO_SELECT_LATEST = poly["auto_select_latest"]
@@ -195,16 +175,22 @@ def load_settings():
                 if "min_prob" in ev: base_settings.MIN_PROB_EV = float(ev["min_prob"])
                 if "min_book_liquidity_usd" in ev: base_settings.MIN_BOOK_LIQUIDITY_USD = float(ev["min_book_liquidity_usd"])
 
-            if "settlement" in config_data:
-                st = config_data["settlement"]
-                if "authoritative_settle_wait_s" in st:
-                    base_settings.AUTHORITATIVE_SETTLE_WAIT_S = float(st["authoritative_settle_wait_s"])
-
             if "flip" in config_data:
                 flip = config_data["flip"]
                 if "enabled" in flip: base_settings.FLIP_ENABLED = bool(flip["enabled"])
                 if "min_conviction" in flip: base_settings.FLIP_MIN_CONVICTION = float(flip["min_conviction"])
                 if "min_minutes_left" in flip: base_settings.FLIP_MIN_MINUTES_LEFT = float(flip["min_minutes_left"])
+
+            if "tp_sl" in config_data:
+                ts = config_data["tp_sl"]
+                if "enabled" in ts: base_settings.TP_SL_ENABLED = bool(ts["enabled"])
+                if "take_profit_pct" in ts: base_settings.TAKE_PROFIT_PCT = float(ts["take_profit_pct"])
+                if "stop_loss_pct" in ts: base_settings.STOP_LOSS_PCT = float(ts["stop_loss_pct"])
+
+            if "telegram" in config_data:
+                tg = config_data["telegram"]
+                if "enabled" in tg: base_settings.TELEGRAM_ENABLED = bool(tg["enabled"])
+                if "bot_token" in tg: base_settings.TELEGRAM_BOT_TOKEN = tg["bot_token"]
 
             if "chainlink" in config_data:
                 cl = config_data["chainlink"]

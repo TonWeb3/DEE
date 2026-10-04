@@ -2,10 +2,6 @@
 
 A real-time trading assistant for Polymarket **"Bitcoin Up or Down" 15-minute** markets, ported to Python and FastAPI.
 
-> **📖 Full reference: [`documentation.md`](documentation.md)** — the strategy, the
-> strike mechanism, settlement, config, API and known limits, in detail. This README is
-> the quick start.
-
 It runs a **latency-arbitrage** strategy: a fast closed-form fair probability from
 Binance spot vs Polymarket's (possibly stale) implied price, traded on the gap, with
 position size set by a simple percent-of-balance or fixed-dollar risk. See
@@ -15,16 +11,13 @@ position size set by a simple percent-of-balance or fixed-dollar risk. See
 
 - Real-time Web Dashboard (FastAPI + Jinja2 + Alpine.js)
 - Fast fair-probability model (closed-form GBM) + EV entry engine
-- Veto filters: RSI extremes, Heiken-Ashi exhaustion
 - Trade Execution: Paper Trading simulation vs Live Mode toggle
 - Data Sources: Binance, Polymarket (Gamma/CLOB), Chainlink (WebSocket + RPC)
 - Proxy Support: Global HTTP/HTTPS/SOCKS proxy configuration
 
 ## Requirements
 
-- Python **3.12+** — required, not preferred. `polymarket-apis` declares
-  `Requires-Python >=3.12`; on 3.11 pip ignores every published version and fails with
-  the confusing `Could not find a version ... (from versions: none)`.
+- Python **3.11+**
 - pip (comes with Python)
 
 ## Local Run
@@ -84,37 +77,27 @@ The repository includes a `render.yaml`. When creating a new blueprint on Render
 
 ## Live Trading
 
-Switching **Mode** to `live` makes the bot place real **Fill-Or-Kill market BUY**
-orders on **Polymarket CLOB V2** via `polymarket-apis`, using the gasless
-**deposit-wallet** flow.
+Switching **Mode** to `live` (config or the Settings page) makes the bot place real
+**Fill-Or-Kill market BUY** orders on the Polymarket CLOB via `py-clob-client`.
 
-Your trading wallet is **derived from your key** — there is no signature type or funder
-address to choose. The bot checks the deposit, proxy and safe wallets and trades from
-whichever actually holds **pUSD**.
+Before enabling live mode you must, once and outside this app:
 
-1. Set a **private key or 12/24-word seed phrase** (Settings → Credentials, or
-   `config.json`). It signs orders but holds no funds and needs no gas.
-2. Set the **Relayer API key** (`config.json` → `relayer.api_key`). It sponsors the
-   one-time on-chain setup, so you never pay gas. Optionally set an **Alchemy key** for
-   a private Polygon RPC.
-3. Click **Test Connection** — read-only, no relayer key needed. It lists every derived
-   wallet with its pUSD balance and ticks the one that will be traded.
-4. **Deposit pUSD** to that wallet through Polymarket.
-5. Click **Setup Wallet (gasless)** to deploy + approve it. Once per fresh wallet.
-6. *(Optional)* **Enable Auto-Redeem** so wins convert back to pUSD by themselves.
-7. *(Optional)* **Auto-Withdrawal** (Settings → Capital Extractor): once equity reaches
-   your trigger, the bot pauses entries, sells any open position, withdraws a fixed
-   amount of pUSD to your own wallet (gasless) and resumes at the next 15m window.
-   Live mode only, off by default. Add a **Telegram** bot token to be alerted each time
-   one completes. See [`documentation.md`](documentation.md) §8a–8b.
+1. Set a `private_key` (Settings → Credentials, or `config.json`).
+2. Choose the **Signature Type**: `0` = EOA (your own wallet), `1` = Email/Magic
+   proxy, `2` = Browser proxy. For `1`/`2` you must also set the **Funder** (proxy
+   wallet address). EOA leaves Funder blank.
+3. Fund that wallet with **USDC on Polygon** (plus a little POL for gas).
+4. **Approve the exchange contracts.** For an EOA, click **Setup Allowances
+   (EOA only)** on the Settings page (or `POST /api/setup-allowances`) — it sends
+   the one-time USDC/CTF approvals to the Polymarket exchange, neg-risk exchange,
+   and neg-risk adapter, skipping any that are already set. Proxy wallets already
+   have allowances managed by Polymarket.
 
-Orders are **slippage-capped**: the limit is the quote plus `CLOB_MAX_SLIPPAGE`
-(default 2¢), so if the book moves away the order is killed rather than filled badly. A
-fill is only recorded when it is positively confirmed, and the trade is stamped with the
-**actual** fill price and size. In live mode the dashboard balance is the real on-chain
-pUSD balance (refreshed every 30s). Order failures appear in the Console Log.
-
-**Press Start on the dashboard** — the bot does not trade until you do.
+Orders are placed as **slippage-capped marketable Fill-Or-Kill** orders: the limit
+price is the current market quote plus a small buffer (`CLOB_MAX_SLIPPAGE`, default
+2¢), so if the book moves away the order is killed rather than filled at a bad
+price. In live mode the dashboard balance reflects the real on-chain USDC balance
+(refreshed periodically). Order failures are reported in the Console Log.
 
 ## Safety
 

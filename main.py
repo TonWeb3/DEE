@@ -2,18 +2,18 @@ import asyncio
 import time
 import json
 import os
-import math
-from datetime import datetime
-from typing import Dict, Any, Optional
+from datetime import datetime, timedelta, timezone
+from typing import Dict, Any, List, Optional, Tuple
 
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, Request, WebSocket
-from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
+from fastapi import FastAPI, Request
+from fastapi.responses import HTMLResponse
 from fastapi.templating import Jinja2Templates
 
 from bot.config import settings
 import bot.data as data
 import bot.ws_data as ws_data
+import bot.clob_ws as clob_ws
 import bot.chainlink as chainlink
 import bot.indicators as indicators
 import bot.engines as engines
@@ -35,11 +35,10 @@ async def lifespan(app: FastAPI):
         asyncio.create_task(binance_kline_1m.start()),
         asyncio.create_task(binance_kline_5m.start()),
         asyncio.create_task(polymarket_ws_stream.start()),
-        asyncio.create_task(polymarket_clob_ws.start()),
         asyncio.create_task(chainlink_ws_stream.start()),
+        asyncio.create_task(clob_ob_stream.start()),   # real-time CLOB order-book (Polymarket odds)
+        asyncio.create_task(update_loop()),
         asyncio.create_task(telegram_poller()),   # auto-subscribe: collect everyone who starts the bot
-        asyncio.create_task(entry_watcher()),     # event-driven entries, off the 1 Hz clock
-        asyncio.create_task(update_loop())
     ]
 
     yield
@@ -52,8 +51,8 @@ async def lifespan(app: FastAPI):
     binance_kline_1m.close()
     binance_kline_5m.close()
     polymarket_ws_stream.close()
-    polymarket_clob_ws.close()
     chainlink_ws_stream.close()
+    clob_ob_stream.close()
 
 app = FastAPI(title="Polymarket BTC 15m Assistant", lifespan=lifespan)
 templates = Jinja2Templates(directory="templates")
@@ -69,29 +68,23 @@ state = {
     "logs": [],
     "last_trade_side": None,
     "last_balance_refresh": 0,
-    # Trading is OFF until the user presses Start on the dashboard. Data/prices still
-    # stream; this flag only gates ENTRIES (open positions always settle to expiry).
-    "running": False,
-    # Per-window marked opens, keyed by the market's own eventStartTime (ms):
-    #   {start_ms: {"chainlink": float|None, "binance": float|None,
-    #               "close": float|None, "genuine": bool}}
-    # "chainlink" is the SETTLEMENT strike; "binance" is the model's reference open.
-    "market_opens": {},
-    "last_window_start": None,
-    "last_seen_price": None,
-    # ── Auto-withdrawal (capital extractor) state machine ────────────────────────
-    #   ARMED -> (equity >= trigger) WAITING_FLAT -> (no open trades) WITHDRAWING
+    "running": False,   # trading is OFF until the user presses Start on the dashboard
+    # Auto-withdrawal (capital extractor) state machine:
+    #   ARMED -> (balance>=trigger) WAITING_FLAT -> (no open trades) WITHDRAWING
     #         -> WITHDRAW_SUBMITTED -> ARMED (+ resume)
     "withdraw_state": "ARMED",
-    "last_withdrawal": None,         # {"amount","tx","to","time"} of the most recent one
-    "withdraw_flat_since": None,     # when the account went flat, so the sell can settle
-    "withdraw_submitted_at": 0,      # for the "confirmed" resume mode's timeout
-    "withdraw_locked_market": None,  # after a withdrawal, wait for the NEXT market
+    "last_withdrawal": None,   # {"amount","tx","time"} of the most recent withdrawal
     "telegram_subscribers": {},      # {chat_id: {name,type,added}} — auto-collected
-    # Published each housekeeping tick, consumed by the event-driven entry path.
-    "trade_ctx": {},
-    "event_exec": None,              # an event-path entry's reason, for the next CSV row
-    "log_seq": 0,                    # bumped per log line; lets a push say "new logs"
+    "withdraw_flat_since": None,     # when the account went flat, so the sell can settle
+    "withdraw_locked_market": None,  # after a withdrawal, wait for the NEXT market
+    # After a take-profit / stop-loss close, lock this market id so we don't re-enter
+    # until the next 15m window starts.
+    "tp_sl_locked_market": None,
+    # Per-window Chainlink OPEN prices, keyed by window start ms:
+    #   {start_ms: {"chainlink": float|None, "binance": float|None, "genuine": bool}}
+    # Used to settle trades the way Polymarket does (Chainlink close vs open).
+    "market_opens": {},
+    "last_window_start": None
 }
 
 def save_state():
@@ -134,36 +127,6 @@ def log_message(msg: str):
     state["logs"].append(formatted)
     if len(state["logs"]) > 100:
         state["logs"].pop(0)
-    # Bumped so a pushed snapshot can tell the dashboard "there are new log lines"
-    # without carrying the whole 100-line buffer in every frame.
-    state["log_seq"] += 1
-
-
-# ── Dashboard push ───────────────────────────────────────────────────────────
-# The dashboard used to poll /api/latest once a second, on top of the loop's own
-# 1 Hz rebuild — so a value could be up to ~2s old on screen. Now the server pushes
-# the snapshot the moment it is rebuilt, and again immediately after any discrete
-# event (an entry, Start/Stop), so those appear at once rather than on the next poll.
-_ws_clients = set()
-
-
-async def broadcast_state():
-    """Push the current snapshot to every connected dashboard. Best-effort: a client
-    that errors is dropped, and a failure here must never disturb trading."""
-    if not _ws_clients or not state["latest_data"]:
-        return
-    # Stamped at SEND time, not at rebuild time: a push triggered between ticks (an
-    # entry, Start/Stop) carries the snapshot the loop last built, whose log_seq would
-    # otherwise be stale — and the client uses it to decide whether to refetch logs.
-    state["latest_data"]["log_seq"] = state["log_seq"]
-    dead = []
-    for ws in list(_ws_clients):
-        try:
-            await ws.send_json(state["latest_data"])
-        except Exception:
-            dead.append(ws)
-    for ws in dead:
-        _ws_clients.discard(ws)
 
 SUBSCRIBERS_FILE = "telegram_subscribers.json"
 
@@ -235,20 +198,6 @@ async def send_telegram(text: str):
     except Exception as e:
         log_message(f"Telegram alert error: {e}")
 
-async def send_telegram_to(chat_id: str, text: str):
-    """Send one message to a single chat id (used for subscribe/unsubscribe replies)."""
-    if not settings.TELEGRAM_BOT_TOKEN:
-        return
-    url = f"https://api.telegram.org/bot{settings.TELEGRAM_BOT_TOKEN}/sendMessage"
-    try:
-        import httpx
-        from bot.net_utils import get_proxy_url_for
-        proxy = get_proxy_url_for(url)
-        async with httpx.AsyncClient(proxy=proxy if proxy else None, timeout=10.0) as client:
-            await client.post(url, json={"chat_id": chat_id, "text": text, "parse_mode": "HTML"})
-    except Exception:
-        pass
-
 async def telegram_poller():
     """Continuously read the bot's incoming messages (long-poll getUpdates) and
     auto-subscribe anyone who messages it. `/stop` (or `/unsubscribe`) removes them.
@@ -290,33 +239,28 @@ async def telegram_poller():
             log_message(f"Telegram poller error: {e}")
             await asyncio.sleep(5)
 
+async def send_telegram_to(chat_id: str, text: str):
+    """Send one message to a single chat id (used for subscribe/unsubscribe replies)."""
+    if not settings.TELEGRAM_BOT_TOKEN:
+        return
+    url = f"https://api.telegram.org/bot{settings.TELEGRAM_BOT_TOKEN}/sendMessage"
+    try:
+        import httpx
+        from bot.net_utils import get_proxy_url_for
+        proxy = get_proxy_url_for(url)
+        async with httpx.AsyncClient(proxy=proxy if proxy else None, timeout=10.0) as client:
+            await client.post(url, json={"chat_id": chat_id, "text": text, "parse_mode": "HTML"})
+    except Exception:
+        pass
+
 def get_ws_symbol_filter(symbol: str) -> str:
     s = symbol.upper()
     if s.endswith("USDT"):
         return s[:-4].lower()
     return s.lower()
 
-# ── Event-driven entry primitives ────────────────────────────────────────────
-# Defined before the streams because they are handed to them as callbacks.
-# The path that uses them lives further down, next to update_loop.
-MIN_EVAL_INTERVAL_S = 0.05   # coalesce bursts; 20 evaluations/sec is plenty
-CTX_MAX_AGE_S = 5.0          # housekeeping context older than this is not tradable
-
-_market_event = asyncio.Event()
-_entry_lock = asyncio.Lock()   # execute_trade is not re-entrant: the slot check and
-                               # the append must not interleave between the two paths
-_last_eval_ts = 0.0
-
-
-def _wake_entry(_payload=None):
-    """Synchronous hook handed to both streams. Deliberately does nothing but set a
-    flag — the work happens in entry_watcher, so a burst of ticks collapses into one
-    evaluation instead of spawning a task each."""
-    _market_event.set()
-
-
 # Background task instances
-binance_stream = ws_data.BinanceTradeStream(symbol=settings.SYMBOL, on_update=_wake_entry)
+binance_stream = ws_data.BinanceTradeStream(symbol=settings.SYMBOL)
 binance_kline_1m = ws_data.BinanceKlineStream(symbol=settings.SYMBOL, interval="1m", limit=240)
 binance_kline_5m = ws_data.BinanceKlineStream(symbol=settings.SYMBOL, interval="5m", limit=200)
 
@@ -325,10 +269,10 @@ polymarket_ws_stream = ws_data.PolymarketChainlinkStream(
     symbol_includes=get_ws_symbol_filter(settings.SYMBOL)
 )
 chainlink_ws_stream = ws_data.ChainlinkPriceStream(aggregator=settings.get_aggregator(settings.SYMBOL))
-# Live CLOB order books for the active window's two tokens. Subscribed per market by
-# fetch_polymarket_snapshot(), so it needs no restart when the symbol/series changes.
-polymarket_clob_ws = ws_data.PolymarketClobBookStream(ws_url=settings.POLYMARKET_CLOB_WS_URL,
-                                                     on_update=_wake_entry)
+
+# Real-time Polymarket CLOB order-book stream — drives the displayed "Polymarket
+# Odds" (book midpoint) so they match the site live, instead of the stale REST /price.
+clob_ob_stream = clob_ws.ClobOrderBookStream()
 
 def get_candle_window_timing(window_minutes: int) -> Dict[str, float]:
     now_ms = time.time() * 1000
@@ -395,65 +339,52 @@ async def fetch_polymarket_snapshot() -> Dict[str, Any]:
     if not up_token_id or not down_token_id:
         return {"ok": False, "reason": "missing_token_ids"}
 
-    # ── The price we must pay to BUY is the best ASK ─────────────────────────────
-    # `/price?side=X` quotes the best resting order ON side X of the book, it does NOT
-    # mean "the price to X at". Measured against the live book, 36/36 simultaneous
-    # samples: side=buy == bestBid, side=sell == bestAsk. Quoting side=buy therefore
-    # returned the BID — the price we would SELL at — which overstated every EV by the
-    # full spread and, on a wide book, recorded fills that were never obtainable (a
-    # 0.11 "entry" while the ask stood at 0.89 credits 9x the shares actually buyable).
-    # Take bestAsk from the book we already fetch, and fall back to side=sell.
-    # ── The book: websocket first, REST only as a fallback ───────────────────────
-    # The book is the half of the edge calculation this strategy is racing, so polling
-    # it at 1 Hz while the spot feed is pushed measures the race on the slower clock.
-    # `get_summary` returns None when the socket has no usable book for a token —
-    # unsubscribed, never delivered, or STALE past MAX_BOOK_AGE_S — and only then do we
-    # pay for a REST round trip. The fallback has to be able to fire: a stale-but-present
-    # book that still answered here would pin the bot to a frozen order book forever.
-    polymarket_clob_ws.update_assets([up_token_id, down_token_id])
-    max_age = settings.MAX_BOOK_AGE_S
-    up_book_summary = polymarket_clob_ws.get_summary(up_token_id, max_age_s=max_age) if max_age else None
-    down_book_summary = polymarket_clob_ws.get_summary(down_token_id, max_age_s=max_age) if max_age else None
-    # Which side came from the socket is decided BEFORE the fallback fills the gaps —
-    # afterwards both are non-None and the distinction is gone.
-    ws_up, ws_down = up_book_summary is not None, down_book_summary is not None
-    book_source = "ws" if (ws_up and ws_down) else ("mixed" if (ws_up or ws_down) else "rest")
+    # Point the real-time CLOB stream at this window's tokens (resubscribes on roll).
+    clob_ob_stream.set_assets([up_token_id, down_token_id])
 
-    up_sell = down_sell = None
-    if not (ws_up and ws_down):
-        try:
-            up_sell, down_sell, up_book, down_book = await asyncio.gather(
-                data.fetch_clob_price(up_token_id, "sell"),
-                data.fetch_clob_price(down_token_id, "sell"),
-                data.fetch_order_book(up_token_id) if up_book_summary is None else asyncio.sleep(0, result=None),
-                data.fetch_order_book(down_token_id) if down_book_summary is None else asyncio.sleep(0, result=None)
-            )
-            if up_book_summary is None and up_book is not None:
-                up_book_summary = data.summarize_order_book(up_book)
-            if down_book_summary is None and down_book is not None:
-                down_book_summary = data.summarize_order_book(down_book)
-        except Exception:
-            up_sell = None
-            down_sell = None
-        _empty = {"bestBid": None, "bestAsk": None, "spread": None,
-                  "bidLiquidity": None, "askLiquidity": None, "askLevels": [], "bidLevels": []}
-        if up_book_summary is None:
-            up_book_summary = dict(_empty)
-        if down_book_summary is None:
-            down_book_summary = dict(_empty)
+    try:
+        up_buy, down_buy, up_book, down_book = await asyncio.gather(
+            data.fetch_clob_price(up_token_id, "buy"),
+            data.fetch_clob_price(down_token_id, "buy"),
+            data.fetch_order_book(up_token_id),
+            data.fetch_order_book(down_token_id)
+        )
+        up_book_summary = data.summarize_order_book(up_book)
+        down_book_summary = data.summarize_order_book(down_book)
+    except:
+        up_buy = None
+        down_buy = None
+        up_book_summary = {"bestBid": None, "bestAsk": None, "mid": None, "spread": None, "bidLiquidity": None, "askLiquidity": None}
+        down_book_summary = {"bestBid": None, "bestAsk": None, "mid": None, "spread": None, "bidLiquidity": None, "askLiquidity": None}
 
-    # bestAsk first (same tick as the liquidity we size against), then side=sell, then
-    # Gamma's last price. Gamma is a LAST-TRADE mark, not an executable offer, so it is
-    # a display fallback only and is deliberately last.
-    up_ask = up_book_summary.get("bestAsk") or up_sell or gamma_yes
-    down_ask = down_book_summary.get("bestAsk") or down_sell or gamma_no
+    # ── Displayed "Polymarket Odds" = the ORDER-BOOK MIDPOINT, matching the site. ──
+    # Prefer the real-time CLOB WebSocket book; fall back to the REST book mid, then
+    # gamma's outcomePrices. This is the number shown on the dashboard — NOT the price
+    # we transact at.
+    up_ws = clob_ob_stream.get(up_token_id)
+    down_ws = clob_ob_stream.get(down_token_id)
+    up_odds = up_ws["mid"] if up_ws["mid"] is not None else (up_book_summary.get("mid") if up_book_summary.get("mid") is not None else gamma_yes)
+    down_odds = down_ws["mid"] if down_ws["mid"] is not None else (down_book_summary.get("mid") if down_book_summary.get("mid") is not None else gamma_no)
+    # Normalise so Up + Down = 1 (Polymarket's displayed chances sum to 100%).
+    if up_odds is not None and down_odds is not None and (up_odds + down_odds) > 0:
+        tot = up_odds + down_odds
+        up_odds, down_odds = up_odds / tot, down_odds / tot
+
+    # Executable BUY price = the ASK (what you actually pay). Prefer the live WS ask,
+    # then the REST book ask, then the /price(buy), then gamma. Used for EV / execution.
+    up_exec = up_ws["ask"] if up_ws["ask"] is not None else (up_book_summary.get("bestAsk") or up_buy or gamma_yes)
+    down_exec = down_ws["ask"] if down_ws["ask"] is not None else (down_book_summary.get("bestAsk") or down_buy or gamma_no)
 
     return {
         "ok": True,
         "market": market,
-        "prices": {
-            "up": up_ask,
-            "down": down_ask
+        "prices": {          # executable ask — what a BUY costs (EV / execution)
+            "up": up_exec,
+            "down": down_exec
+        },
+        "odds": {            # book midpoint — the number shown on Polymarket (display)
+            "up": up_odds,
+            "down": down_odds
         },
         "token_ids": {
             "up": up_token_id,
@@ -462,21 +393,12 @@ async def fetch_polymarket_snapshot() -> Dict[str, Any]:
         "orderbook": {
             "up": up_book_summary,
             "down": down_book_summary
-        },
-        # "ws" | "rest" | "mixed" — surfaced so a silent fall back to polling is
-        # visible on the dashboard rather than something you only find in a latency post-mortem.
-        "book_source": book_source
+        }
     }
 
-async def execute_trade(decision: Dict[str, Any], market_prices: Dict[str, Any], market: Dict[str, Any], strike_open: Optional[float], token_ids: Dict[str, Any], orderbook: Optional[Dict[str, Any]] = None,
-                        strike_source: str = "chainlink_ws", window_start_ms: Optional[int] = None,
-                        open_reason: str = "ev_entry"):
+async def execute_trade(decision: Dict[str, Any], market_prices: Dict[str, Any], market: Dict[str, Any], target_open: float, token_ids: Dict[str, Any], orderbook: Optional[Dict[str, Any]] = None, strike_source: str = "chainlink_ws"):
     # Regular entry from decision engine. Returns a short reason string describing
     # the outcome (entered / which gate vetoed it) for diagnostic logging.
-    #
-    # `strike_open` is the SETTLEMENT strike — the Chainlink price latched at the
-    # market's eventStartTime. It is what update_trades() scores the close against, so
-    # it must come from the same feed as the close, NOT from the model's Binance open.
     if decision["action"] != "ENTER":
         return decision.get("reason", "no_trade")
 
@@ -484,11 +406,10 @@ async def execute_trade(decision: Dict[str, Any], market_prices: Dict[str, Any],
     if state["active_trades"]:
         return "slot_busy"
 
-    # No authoritative strike (the Chainlink open at this market's eventStartTime was
-    # never captured) => no trade. Scoring against a guessed open is worse than sitting
-    # the window out, so there is deliberately no Binance/spot fallback here.
-    if strike_open is None:
-        return "no_strike"
+    # No Polymarket/Chainlink open for this window → do NOT open. We can't score the
+    # trade against a real open, so we wait for the next window where we mark it.
+    if target_open is None:
+        return "no_open_price"
 
     side = decision["side"]
 
@@ -511,12 +432,11 @@ async def execute_trade(decision: Dict[str, Any], market_prices: Dict[str, Any],
     if amount_to_risk <= 0:
         return "stake_zero"
 
-    # Liquidity: never outsize what the ask side of the book can absorb. The levels are
-    # now ordered from the touch outward, so this is depth we could actually hit.
+    # Liquidity: never outsize what the ask side of the book can absorb.
     ob = (orderbook or {}).get("up" if side == "UP" else "down") or {}
-    ask_levels = ob.get("askLevels") or []
-    ask_liq_usd = sum(p * s for p, s in ask_levels)
-    if ask_levels:
+    ask_liq_shares = ob.get("askLiquidity")
+    if ask_liq_shares is not None and price > 0:
+        ask_liq_usd = ask_liq_shares * price
         if ask_liq_usd < settings.MIN_BOOK_LIQUIDITY_USD:
             log_message(f"Skip {side}: thin book (${ask_liq_usd:.2f} ask liquidity)")
             return "thin_book"
@@ -547,12 +467,13 @@ async def execute_trade(decision: Dict[str, Any], market_prices: Dict[str, Any],
         "status": "OPEN",
         "settlement_price": None,
         "profit_loss": None,
-        "strike_price": strike_open,       # SETTLEMENT strike: Chainlink @ eventStartTime
-        "strike_source": strike_source,
-        "window_start_ms": int(window_start_ms) if window_start_ms is not None else None,
-        "open_reason": open_reason,        # "ev_entry" | "flip_entry"
-        "close_price": None,               # frozen once, the instant the window expires
+        "strike_price": target_open,
+        "strike_source": strike_source,   # "chainlink_ws" (matches Polymarket) or "binance_open" (fallback)
+        "open_reason": decision.get("reason", "entry"),  # "ev_enter" (EV signal) or "flip_entry" (flip)
         "end_ts": end_ts,
+        # Window this trade belongs to (aligned 15m boundary) — lets a flip-closed
+        # trade be scored against the market's true open/close after the window ends.
+        "window_start_ms": int(end_ts * 1000) - settings.CANDLE_WINDOW_MINUTES * 60_000,
         "mode": state["trading_mode"]
     }
 
@@ -562,10 +483,11 @@ async def execute_trade(decision: Dict[str, Any], market_prices: Dict[str, Any],
         state["last_trade_side"] = side
         save_state()
 
-        log_message(f"Executed PAPER trade: {side} @ {price} for {market.get('slug')} (Amount: ${amount_to_risk:.2f})")
+        open_why = "FLIP" if decision.get("reason") == "flip_entry" else "EV signal"
+        log_message(f"Executed PAPER trade [{open_why}]: {side} @ {price} for {market.get('slug')} (Amount: ${amount_to_risk:.2f})")
         return "entered"
     else:
-        # LIVE: place a real Fill-Or-Kill market BUY on the Polymarket CLOB
+        # LIVE: place a real Fill-Or-Kill market BUY on the Polymarket CLOB.
         token_id = token_ids.get("up") if side == "UP" else token_ids.get("down")
         if not token_id:
             log_message(f"LIVE trade aborted: missing token_id for side {side}")
@@ -573,52 +495,72 @@ async def execute_trade(decision: Dict[str, Any], market_prices: Dict[str, Any],
 
         result = await asyncio.to_thread(clob_trader.place_market_buy, token_id, amount_to_risk, price)
         if result.get("ok"):
-            trade["order_id"] = result.get("order_id")
-            trade["order_response"] = result.get("response") or {}
-            trade["token_id"] = token_id
-            # Record what ACTUALLY filled, not what we asked for. A Fill-Or-Kill can
-            # fill anywhere up to the limit price, so shares != amount / quote. Using
-            # the estimate here would misprice every live position and its P/L.
-            fill_size = result.get("fill_size")
-            fill_price = result.get("fill_price")
-            fill_usd = result.get("fill_usd")
-            if fill_size and fill_price:
-                trade["shares"] = float(fill_size)
-                trade["entry_price"] = float(fill_price)
-                trade["amount"] = float(fill_usd if fill_usd else fill_size * fill_price)
-                trade["quoted_price"] = price          # what we saw before sending
-                trade["slippage"] = float(fill_price) - float(price) if price else None
+            resp = result.get("response") or {}
+            order_id = None
+            if isinstance(resp, dict):
+                order_id = resp.get("orderID") or resp.get("orderId") or resp.get("id")
+            trade["order_id"] = order_id
+            trade["order_response"] = resp
             state["active_trades"].append(trade)
             state["last_trade_side"] = side
             save_state()
-            log_message(
-                f"Executed LIVE trade: {side} ${trade['amount']:.2f} on {market.get('slug')} "
-                f"— {trade['shares']:.2f} shares @ {trade['entry_price']:.4f} "
-                f"(quote {price}, order {trade['order_id']})")
+            open_why = "FLIP" if decision.get("reason") == "flip_entry" else "EV signal"
+            log_message(f"Executed LIVE trade [{open_why}]: {side} ${amount_to_risk:.2f} on {market.get('slug')} (order {order_id})")
             return "entered"
         else:
-            # A KILLED Fill-Or-Kill lands here and opens NO position — which is the
-            # point: previously an unfilled order was recorded as a live trade.
             log_message(f"LIVE trade FAILED ({side}): {result.get('error')}")
             return "live_order_failed"
 
-async def maybe_flip_position(decision: Dict[str, Any], poly_snapshot: Dict[str, Any], time_left_min: Optional[float]):
-    """Close the open position early and flip when a STRONG opposite signal appears.
+async def maybe_flip_position(fair_up: Optional[float], poly_snapshot: Dict[str, Any], time_left_min: Optional[float],
+                              strike_open: Optional[float], strike_source: str = "chainlink_ws"):
+    """Close the open position early and flip to the side favoured by FAIR PROBABILITY.
 
-    Opt-in (FLIP_ENABLED). Guards: the new side must clear FLIP_MIN_CONVICTION and at
-    least FLIP_MIN_MINUTES_LEFT must remain, and we only flip within the same market.
-    After closing here, execute_trade() opens the new side (slot is now free).
+    EV is NOT considered here — the flip is driven purely by the model's fair
+    probability. Opt-in (FLIP_ENABLED). Guards: the favoured side's fair prob must
+    clear FLIP_MIN_CONVICTION, at least FLIP_MIN_MINUTES_LEFT must remain, we only flip
+    within the same market, and we must have this window's Chainlink open. This
+    function both CLOSES the old side and OPENS the new one (the normal execute_trade
+    path is EV-gated and would refuse to re-enter).
+
+    Every skip is logged (once per reason-change) so it's always visible WHY a flip
+    that "should" have happened did not.
     """
+    def _skip(reason: str):
+        if state.get("last_flip_skip") != reason:
+            state["last_flip_skip"] = reason
+            log_message(f"FLIP skipped: {reason}")
+
     if not settings.FLIP_ENABLED:
         return
-    if decision.get("action") != "ENTER" or not state["active_trades"]:
+    if not state["active_trades"] or fair_up is None:
         return
 
-    new_side = decision["side"]
-    new_prob = decision.get("prob", 0) or 0
+    trade = state["active_trades"][0]
+
+    # Side favoured purely by the fair-probability model (no EV).
+    new_side = "UP" if fair_up >= 0.5 else "DOWN"
+    new_prob = fair_up if new_side == "UP" else (1.0 - fair_up)
+
+    # Only interesting once the model favours the OPPOSITE side of what we hold.
+    if trade["side"] == new_side:
+        state["last_flip_skip"] = None  # back on the held side — reset
+        return
+
+    # ONE FLIP PER MARKET: if this position is itself the result of a flip, hold it
+    # to settlement — never flip again. (Analysis showed the flip *trigger* is usually
+    # right, but repeated flipping/churn bleeds the edge on spread + late re-entries.)
+    if trade.get("open_reason") == "flip_entry":
+        _skip("already flipped once this market — holding to settlement")
+        return
+
     if new_prob < settings.FLIP_MIN_CONVICTION:
+        _skip(f"{new_side} conviction {new_prob:.2f} < {settings.FLIP_MIN_CONVICTION:.2f}")
+        return
+    if strike_open is None:
+        _skip("no Chainlink open captured for this window")
         return
     if time_left_min is not None and time_left_min < settings.FLIP_MIN_MINUTES_LEFT:
+        _skip(f"only {time_left_min:.1f}m left < {settings.FLIP_MIN_MINUTES_LEFT:.0f}m required")
         return
 
     market = poly_snapshot["market"]
@@ -626,31 +568,25 @@ async def maybe_flip_position(decision: Dict[str, Any], poly_snapshot: Dict[str,
     token_ids = poly_snapshot.get("token_ids", {})
     orderbook = poly_snapshot.get("orderbook", {})
 
-    trade = state["active_trades"][0]
-    if trade["side"] == new_side:
-        return  # already on the signalled side
     if str(trade.get("market_id")) != str(market.get("id")):
-        return  # different market — let the old one settle on its own
+        _skip("position is in a prior market (window rolled)")
+        return
 
     held_key = "up" if trade["side"] == "UP" else "down"
     ob = orderbook.get(held_key) or {}
     exit_price = ob.get("bestBid") or prices.get(held_key)
     if not exit_price or exit_price <= 0:
-        log_message(f"FLIP aborted: no exit price for {trade['side']}")
+        _skip(f"no exit price for {trade['side']}")
         return
+
+    state["last_flip_skip"] = None  # clearing — we're about to flip
 
     if state["trading_mode"] == "live":
         token_id = token_ids.get(held_key)
         result = await asyncio.to_thread(clob_trader.place_market_sell, token_id, trade["shares"], exit_price)
         if not result.get("ok"):
-            # Killed FOK => we still HOLD the position. Leave it open and let it settle
-            # at expiry rather than recording a close that never happened.
-            log_message(f"FLIP sell FAILED ({trade['side']}): {result.get('error')} — position kept")
+            log_message(f"FLIP sell FAILED ({trade['side']}): {result.get('error')}")
             return
-        # Price the exit off the REAL fill, not the quote we aimed at.
-        if result.get("fill_price"):
-            exit_price = float(result["fill_price"])
-        trade["exit_order_id"] = result.get("order_id")
         # live balance is refreshed from chain elsewhere
     else:
         state["paper_balance"] += trade["shares"] * exit_price  # proceeds from selling out
@@ -658,157 +594,32 @@ async def maybe_flip_position(decision: Dict[str, Any], poly_snapshot: Dict[str,
     trade["status"] = "CLOSED"
     trade["exit_time"] = datetime.now().isoformat()
     trade["exit_reason"] = "flip"
-    trade["resolution"] = "flip_exit"
     trade["settlement_price_at_expiry"] = exit_price
-    # A flip exits on the BOOK, not at expiry — so there is no window close price.
-    # Record the marked open and the BTC price we bailed at, for the history table.
-    trade["open_price"] = trade.get("strike_price")
-    trade["close_price"] = state.get("last_seen_price")
     trade["profit_loss"] = (trade["shares"] * exit_price) - trade["amount"]
-    state["trade_history"].append(_archive(trade))
+    # The realized P/L above is the early-exit sell. Record the market OPEN now; the
+    # CLOSE + whether this side actually won gets backfilled once the window ends
+    # (see the backfill pass in update_loop). This is why a flip can book a loss even
+    # though the market later resolves in this side's favour.
+    trade["open_price"] = trade.get("strike_price")
+    trade["exit_mark"] = exit_price  # price we sold out at (not the market close)
+    state["trade_history"].append(trade)
     state["active_trades"] = [t for t in state["active_trades"] if t is not trade]
     state["last_trade_side"] = None
     save_state()
-    log_message(f"FLIP: closed {trade['side']} @ {exit_price:.2f} (P/L ${trade['profit_loss']:.2f}); opening {new_side}")
-    return new_side   # truthy => the entry that follows is a flip entry, not a fresh EV entry
+    log_message(f"FLIP: closed {trade['side']} @ {exit_price:.2f} (P/L ${trade['profit_loss']:.2f}); opening {new_side} (fair prob {new_prob:.2f})")
 
-MARK_CAPTURE_WINDOW_MS = 20_000   # how late after eventStartTime a latch still counts
-
-# How old a feed value may be before it stops counting as "the price right now".
-# Polymarket's crypto_prices_chainlink stream ticks about once a second, so a value
-# older than this means the socket is dead, not that the market is quiet. The on-chain
-# sources report the aggregator's ROUND timestamp, which is legitimately minutes old
-# between posts, so theirs is only a liveness check.
-POLY_WS_MAX_AGE_MS = 10_000
-ONCHAIN_MAX_AGE_MS = 15 * 60_000
-
-
-def mark_window_open(start_ms: int, window_ms: int, current_price: Optional[float],
-                     spot_price: Optional[float], price_source: Optional[str],
-                     price_is_fresh: bool = True) -> Dict[str, Any]:
-    """Latch this window's OPEN at the market's own eventStartTime and return its record.
-
-    Two values are captured at the SAME instant:
-      "chainlink" -> the SETTLEMENT strike, the price Polymarket resolves against
-      "binance"   -> the MODEL's reference open, so fair_prob keeps measuring the
-                     Binance move since the open exactly as it always has
-    Mixing the feeds (Binance spot vs a Chainlink open) would inject a constant
-    ~0.13% offset straight into the model, which on a 15m window is the same order
-    of magnitude as the move being predicted.
-
-    A window is only marked when `genuine` — i.e. we were already running through the
-    immediately-preceding window, so the first price we see in this one really is its
-    open. Otherwise "chainlink" stays None and the caller opens no trade: no API can
-    fetch a past open, and scoring against a guess is worse than sitting the window out.
-    """
-    opens = state["market_opens"]
-    prev_ws = state.get("last_window_start")
-
-    # On rollover, freeze the PRIOR window's close = the last price seen inside it.
-    if prev_ws is not None and prev_ws != start_ms and prev_ws in opens:
-        if opens[prev_ws].get("close") is None and state.get("last_seen_price"):
-            opens[prev_ws]["close"] = state["last_seen_price"]
-    if current_price:
-        state["last_seen_price"] = current_price
-
-    observed_prev = prev_ws is not None and abs((start_ms - window_ms) - prev_ws) < 2000
-    if start_ms not in opens:
-        opens[start_ms] = {"chainlink": None, "binance": None,
-                           "close": None, "genuine": observed_prev}
-        for k in list(opens.keys()):           # prune old windows
-            if k < start_ms - 4 * window_ms:
-                del opens[k]
-
-    win = opens[start_ms]
-    # `since_start` must be within [0, MARK_CAPTURE_WINDOW_MS): too late and the price
-    # is no longer the open; NEGATIVE means eventStartTime is still in the future (the
-    # market hasn't begun) and latching would freeze a pre-open price as the strike.
-    since_start = time.time() * 1000 - start_ms
-    # `price_is_fresh` is the point of the whole guard: being inside the capture window
-    # says OUR CLOCK is near the open, it says nothing about how old the PRICE is. A
-    # stalled socket returns its last value forever, and latching that freezes a strike
-    # from minutes earlier - measured at a median of 22s before the window open across
-    # 113 live trades, worst case $86 off the true tick.
-    if (win["chainlink"] is None and win["genuine"] and current_price and price_is_fresh
-            and 0 <= since_start < MARK_CAPTURE_WINDOW_MS):
-        win["chainlink"] = current_price
-        win["binance"] = spot_price
-        log_message(f"Window open marked @ eventStartTime: Chainlink {current_price:.2f} "
-                    f"({price_source}) / Binance {spot_price if spot_price else '-'}")
-    state["last_window_start"] = start_ms
-    return win
-
-
-async def _redeem_win(trade: Dict[str, Any], market: Optional[Dict[str, Any]],
-                      up_index: int, down_index: int, winning_index: int):
-    """Redeem a winning LIVE position into pUSD.
-
-    Winning outcome tokens are CTF conditional tokens worth $1 each; they only become
-    spendable collateral once redeemed. `get_usdc_balance()` reads pUSD and cannot see
-    them, so without this a live win never shows up in the balance.
-
-    Best-effort: the result is recorded on the trade either way, and a failure is
-    logged rather than raised — settlement must never be blocked by a redeem problem.
-    """
-    condition_id = (market or {}).get("conditionId") or (market or {}).get("condition_id")
-    if not condition_id:
-        trade["redeem"] = {"ok": False, "error": "missing_condition_id"}
-        log_message(f"REDEEM skipped for {trade['market_slug']}: no conditionId on the market")
-        return
-
-    # The CTF expects one amount per outcome, in index order; the losing leg is 0.
-    amounts = [0.0, 0.0]
-    idx = up_index if winning_index == up_index else down_index
-    if 0 <= idx < len(amounts):
-        amounts[idx] = float(trade.get("shares") or 0.0)
-
-    neg_risk = bool((market or {}).get("negRisk") or (market or {}).get("neg_risk") or False)
-    try:
-        res = await asyncio.to_thread(clob_trader.redeem, condition_id, amounts, neg_risk)
-    except Exception as e:
-        res = {"ok": False, "error": f"{type(e).__name__}: {e}"}
-
-    trade["redeem"] = res
-    if res.get("ok"):
-        log_message(f"REDEEM ok for {trade['market_slug']}: {amounts[idx]:.2f} shares (tx {res.get('tx')})")
-    else:
-        log_message(f"REDEEM FAILED for {trade['market_slug']}: {res.get('error')} "
-                    f"— redeem manually on Polymarket to free the capital")
-
-
-def _archive(trade: Dict[str, Any]) -> Dict[str, Any]:
-    """Strip bulky/internal scratch keys before a trade goes into trade_history.
-
-    `_market` caches a whole Gamma market payload while the trade is open; writing
-    that into state_data.json every settle would bloat the file for no benefit.
-    """
-    for k in ("_market", "_market_closed", "order_response"):
-        trade.pop(k, None)
-    return trade
-
-
-def exit_price_for(poly_snapshot: Dict[str, Any], side: str, shares: float):
-    """The all-in price selling `shares` would fetch on the bid side, by walking the
-    book rather than valuing the whole position at the touch. Returns
-    (avg_price, shares_sellable, proceeds)."""
-    key = "up" if side == "UP" else "down"
-    ob = (poly_snapshot.get("orderbook") or {}).get(key) or {}
-    levels = ob.get("bidLevels") or []
-    avg, sold, proceeds = data.sweep_sell(levels, shares)
-    if avg is None:
-        return ob.get("bestBid"), 0.0, 0.0
-    return avg, sold, proceeds
+    # Open the new side immediately — driven by FAIR PROBABILITY, not EV. A synthetic
+    # ENTER decision reuses execute_trade's sizing / liquidity / live-order logic.
+    flip_decision = {"action": "ENTER", "side": new_side, "phase": "FLIP", "strength": "FLIP",
+                     "prob": new_prob, "reason": "flip_entry"}
+    await execute_trade(flip_decision, prices, market, strike_open, token_ids, orderbook, strike_source)
+    return new_side  # signal to the loop that a flip happened this tick
 
 
 async def close_open_position(poly_snapshot: Dict[str, Any], reason: str):
-    """Sell the open position into the bid side and book the realized P/L. Used by the
-    auto-withdrawal to go flat before extracting funds. Returns
-    {"side","exit_price","pl"} on success, else None.
-
-    Live sells are RETRY-BOUNDED (`EXIT_MAX_RETRIES`): without a bound, a rejected FOK
-    becomes a fresh sell order on every tick, chasing the book down. When the retries
-    are spent the position simply settles at expiry as it normally would.
-    """
+    """Sell the open position at the current bid and book the realized P/L. Used by
+    take-profit / stop-loss and by the auto-withdrawal (to go flat before extracting
+    funds). Returns {"side","exit_price","pl"} on success, else None."""
     if not state["active_trades"] or not poly_snapshot.get("ok"):
         return None
     trade = state["active_trades"][0]
@@ -816,177 +627,85 @@ async def close_open_position(poly_snapshot: Dict[str, Any], reason: str):
     if str(trade.get("market_id")) != str(market.get("id")):
         return None  # position is in a prior market — let it settle on its own
 
-    attempts = trade.get("exit_attempts", {}).get(reason, 0)
-    if settings.EXIT_MAX_RETRIES > 0 and attempts >= settings.EXIT_MAX_RETRIES:
-        return None  # give up on this exit; the position settles at expiry
-
+    prices = poly_snapshot["prices"]
+    orderbook = poly_snapshot.get("orderbook", {})
     token_ids = poly_snapshot.get("token_ids", {})
     held_key = "up" if trade["side"] == "UP" else "down"
-    exit_price, sellable, _ = exit_price_for(poly_snapshot, trade["side"], trade["shares"])
+    ob = orderbook.get(held_key) or {}
+    exit_price = ob.get("bestBid") or prices.get(held_key)
     if not exit_price or exit_price <= 0:
-        return None
-    # A Fill-Or-Kill sell of the whole position is KILLED outright if the bid side
-    # cannot absorb it, so don't pretend otherwise — in paper that would credit
-    # proceeds the book could never pay, and in live it just burns a retry.
-    if sellable < trade["shares"] * 0.999:
         return None
 
     if state["trading_mode"] == "live":
         token_id = token_ids.get(held_key)
-        result = await asyncio.to_thread(clob_trader.place_market_sell, token_id,
-                                         trade["shares"], exit_price)
+        result = await asyncio.to_thread(clob_trader.place_market_sell, token_id, trade["shares"], exit_price)
         if not result.get("ok"):
-            trade.setdefault("exit_attempts", {})[reason] = attempts + 1
-            left = max(0, settings.EXIT_MAX_RETRIES - (attempts + 1))
-            log_message(f"{reason} sell FAILED ({trade['side']}): {result.get('error')} "
-                        f"— {left} attempt(s) left")
-            if left == 0:
-                log_message(f"{reason}: giving up on the early exit; holding {trade['side']} to expiry")
-            save_state()
+            log_message(f"{reason} sell FAILED ({trade['side']}): {result.get('error')}")
             return None
-        # Book the REAL fill, not the quote we aimed at.
-        if result.get("fill_price") and result.get("fill_size"):
-            exit_price = float(result["fill_price"])
-            proceeds = result.get("fill_usd") or (result["fill_size"] * exit_price)
-        else:
-            proceeds = trade["shares"] * exit_price
-        trade["exit_order_id"] = result.get("order_id")
-        state["last_balance_refresh"] = 0   # re-read the on-chain balance next tick
     else:
-        proceeds = trade["shares"] * exit_price
-        state["paper_balance"] += proceeds
+        state["paper_balance"] += trade["shares"] * exit_price
 
-    pl = proceeds - trade["amount"]
+    pl = (trade["shares"] * exit_price) - trade["amount"]
     side = trade["side"]
     trade["status"] = "CLOSED"
     trade["exit_time"] = datetime.now().isoformat()
     trade["exit_reason"] = reason
-    trade["resolution"] = "early_exit"
     trade["settlement_price_at_expiry"] = exit_price
     trade["profit_loss"] = pl
-    trade["exit_proceeds"] = proceeds
-    # An early exit books its P/L on the SELL, not on the window's outcome. Record the
-    # marked open and the BTC price we bailed at, for the history table.
     trade["open_price"] = trade.get("strike_price")
-    trade["close_price"] = state.get("last_seen_price")
-    state["trade_history"].append(_archive(trade))
+    trade["exit_mark"] = exit_price
+    state["trade_history"].append(trade)
     state["active_trades"] = [t for t in state["active_trades"] if t is not trade]
     state["last_trade_side"] = None
     save_state()
     return {"side": side, "exit_price": exit_price, "pl": pl}
 
 
-async def maybe_auto_withdraw(equity: Optional[float], poly_snapshot: Dict[str, Any]):
-    """Auto-withdrawal (capital extractor) state machine — LIVE mode only.
+async def maybe_tp_sl(poly_snapshot: Dict[str, Any]):
+    """Take-profit / stop-loss early exit. Closes the open position when its unrealized
+    P/L (marked at the current bid) reaches +TAKE_PROFIT_PCT or -STOP_LOSS_PCT of the
+    stake. After it fires, the market is locked so we don't re-enter until the next
+    15m window. Returns "take_profit"/"stop_loss" if it closed, else None."""
+    if not settings.TP_SL_ENABLED or not state["active_trades"]:
+        return None
+    if not poly_snapshot.get("ok"):
+        return None
 
-        ARMED --(EQUITY >= trigger)--> WAITING_FLAT --(close any open trade, go flat)-->
-        WITHDRAWING --(submitted)--> WITHDRAW_SUBMITTED --> ARMED
+    trade = state["active_trades"][0]
+    market = poly_snapshot["market"]
+    if str(trade.get("market_id")) != str(market.get("id")):
+        return None  # position is in a prior market — let it settle on its own
 
-    The trigger uses **equity** (cash + the value of any open position), so a running
-    trade still counts toward the threshold. If a trade is open when the trigger fires
-    it is CLOSED IMMEDIATELY (sold at the bid) so the balance settles into cash.
+    prices = poly_snapshot["prices"]
+    orderbook = poly_snapshot.get("orderbook", {})
+    held_key = "up" if trade["side"] == "UP" else "down"
+    ob = orderbook.get(held_key) or {}
+    exit_price = ob.get("bestBid") or prices.get(held_key)   # what we'd get selling now
+    if not exit_price or exit_price <= 0:
+        return None
 
-    After the withdrawal:
-      - auto_resume ON  -> trading resumes at the NEXT 15m market (this one is locked).
-      - auto_resume OFF -> the bot is STOPPED entirely.
+    amount = trade["amount"]
+    unreal = (trade["shares"] * exit_price) - amount
+    pl_pct = (unreal / amount) * 100.0 if amount else 0.0
 
-    Paper mode never withdraws — there is nothing to withdraw — and the state machine
-    is held disarmed so it can never pause entries in a mode it does not apply to.
-    """
-    if state["trading_mode"] != "live" or not settings.AUTO_WITHDRAW_ENABLED:
-        if state["withdraw_state"] != "ARMED":   # disabled -> never keep entries paused
-            state["withdraw_state"] = "ARMED"
-        return
+    hit = None
+    if settings.TAKE_PROFIT_PCT > 0 and pl_pct >= settings.TAKE_PROFIT_PCT:
+        hit = "take_profit"
+    elif settings.STOP_LOSS_PCT > 0 and pl_pct <= -settings.STOP_LOSS_PCT:
+        hit = "stop_loss"
+    if not hit:
+        return None
 
-    st = state["withdraw_state"]
-    cash = state["paper_balance"]  # the live pUSD balance is mirrored here
-
-    if st == "ARMED":
-        # Trigger on EQUITY, not just cash — so an open trade counts toward it.
-        if equity is not None and equity >= settings.WITHDRAW_TRIGGER_BALANCE:
-            state["withdraw_state"] = "WAITING_FLAT"
-            state["withdraw_flat_since"] = None
-            log_message(f"Auto-withdraw: equity ${equity:.2f} >= ${settings.WITHDRAW_TRIGGER_BALANCE:.2f} "
-                        f"-> pausing entries and closing any open trade")
-
-    elif st == "WAITING_FLAT":
-        # Close the open position immediately so the funds settle into cash.
-        if state["active_trades"]:
-            res = await close_open_position(poly_snapshot, "withdraw_close")
-            if res:
-                log_message(f"Auto-withdraw: closed {res['side']} @ {res['exit_price']:.2f} "
-                            f"(P/L ${res['pl']:.2f}) to go flat")
-                state["withdraw_flat_since"] = time.time()
-                state["last_balance_refresh"] = 0   # re-read the on-chain balance next tick
-            return
-        # Flat — give the sell a moment to settle on-chain before reading the balance.
-        if state.get("withdraw_flat_since") is None:
-            state["withdraw_flat_since"] = time.time()
-            state["last_balance_refresh"] = 0
-            return
-        if time.time() - state["withdraw_flat_since"] < 5:
-            return
-        state["withdraw_flat_since"] = None
-        state["withdraw_state"] = "WITHDRAWING"
-        log_message("Auto-withdraw: account is flat -> withdrawing")
-
-    elif st == "WITHDRAWING":
-        # Destination: the user-set address, or your own wallet (the EOA derived from
-        # the key/seed) when left blank.
-        recipient = settings.WITHDRAW_ADDRESS or clob_trader.get_eoa_address()
-        if not recipient:
-            log_message("Auto-withdraw aborted: no wallet/key available. Disarming.")
-            state["withdraw_state"] = "ARMED"
-            return
-        amount = min(float(settings.WITHDRAW_AMOUNT), float(cash or 0))
-        if amount <= 0:
-            log_message("Auto-withdraw aborted: no cash balance to withdraw. Disarming.")
-            state["withdraw_state"] = "ARMED"
-            return
-        result = await asyncio.to_thread(clob_trader.withdraw_pusd, recipient, amount)
-        if result.get("ok"):
-            when = datetime.now()
-            tx = result.get("tx")
-            state["last_withdrawal"] = {"amount": result.get("amount"), "tx": tx,
-                                        "to": result.get("recipient"), "time": when.isoformat()}
-            state["withdraw_state"] = "WITHDRAW_SUBMITTED"
-            state["withdraw_submitted_at"] = time.time()
-            log_message(f"Auto-withdraw: submitted ${amount:.2f} -> {recipient} (tx {tx})")
-            # Telegram alert: a withdrawal happened — time + amount.
-            await send_telegram(
-                "💸 <b>Withdrawal completed</b>\n"
-                f"Amount: <b>${amount:.2f}</b>\n"
-                f"Time: {when.strftime('%Y-%m-%d %H:%M:%S')}\n"
-                f"To: <code>{recipient}</code>"
-                + (f"\nTx: <code>{tx}</code>" if tx else "")
-            )
-        else:
-            log_message(f"Auto-withdraw FAILED: {result.get('error')}. Disarming.")
-            state["withdraw_state"] = "ARMED"
-
-    elif st == "WITHDRAW_SUBMITTED":
-        state["last_balance_refresh"] = 0  # fresh balance read so a stale value can't re-trigger
-        if str(settings.WITHDRAW_RESUME_AFTER).lower() == "confirmed":
-            tx = (state.get("last_withdrawal") or {}).get("tx")
-            waited = time.time() - state.get("withdraw_submitted_at", time.time())
-            confirmed = await asyncio.to_thread(clob_trader.is_tx_confirmed, tx) if tx else None
-            if confirmed is not True and waited < 180:
-                return   # keep waiting for the receipt (entries stay paused)
-            if confirmed is True:
-                log_message(f"Auto-withdraw: tx confirmed on-chain ({tx})")
-            else:
-                log_message(f"Auto-withdraw: no confirmation after {waited:.0f}s; resuming anyway")
-        if not settings.WITHDRAW_AUTO_RESUME:
-            state["running"] = False
-            _reflect_running_now()
-            log_message("Auto-withdraw complete; auto-resume OFF -> bot STOPPED.")
-        else:
-            # Resume, but not in the market we just exited — wait for the next 15m one.
-            mkt_id = str(poly_snapshot["market"].get("id")) if poly_snapshot.get("ok") else None
-            if mkt_id:
-                state["withdraw_locked_market"] = mkt_id
-            log_message("Auto-withdraw complete; trading resumes at the next 15m market.")
-        state["withdraw_state"] = "ARMED"
+    res = await close_open_position(poly_snapshot, hit)
+    if not res:
+        return None
+    # Lock this market so no re-entry until the next 15m window.
+    state["tp_sl_locked_market"] = str(market.get("id"))
+    save_state()
+    label = "TAKE PROFIT" if hit == "take_profit" else "STOP LOSS"
+    log_message(f"{label}: closed {res['side']} @ {res['exit_price']:.2f} "
+                f"(P/L ${res['pl']:.2f}, {pl_pct:+.1f}%); locked market until next window")
+    return hit
 
 
 async def update_trades(current_prices: Dict[str, Any]):
@@ -996,8 +715,8 @@ async def update_trades(current_prices: Dict[str, Any]):
 
     # Freshest price to settle against — the CLOSE price. Polymarket settles on
     # Chainlink, and the strike (open) is now the Chainlink WS value too, so prefer
-    # Chainlink here: open and close then come from the SAME feed and no cross-feed
-    # offset can flip a near-the-money result. Binance spot is a last resort only.
+    # Chainlink here so open and close come from the SAME feed (no cross-feed offset
+    # can flip a near-the-money result). Binance spot is only a last-resort fallback.
     cur_price = current_prices.get("chainlink") or current_prices.get("spot")
     SETTLEMENT_GRACE_SECONDS = 300  # if still unresolvable this long past expiry, void it
 
@@ -1017,41 +736,29 @@ async def update_trades(current_prices: Dict[str, Any]):
                 end_ts = now_ts
         expired = now_ts >= end_ts
 
-        # Freeze the CLOSE the instant the window ends. Polymarket settles on the
-        # Chainlink value AT the close time — not whenever we happen to get around to
-        # resolving (which can lag by many seconds). Capturing it once here stops
-        # post-expiry drift from flipping a near-the-money win/loss.
+        # Freeze the CLOSE price the instant the window ends. Polymarket settles on the
+        # Chainlink value AT the close time — not whenever we happen to resolve (which
+        # can lag 15s+ behind). Capturing it once here stops post-expiry price drift
+        # from flipping a near-the-money win/loss.
         if expired and trade.get("close_price") is None:
             frozen_close = cur_price or trade.get("last_price")
             if frozen_close:
                 trade["close_price"] = frozen_close
 
-        # Poll the market for the AUTHORITATIVE Polymarket resolution. Before expiry
-        # this is a cheap ~30s heartbeat; ONCE EXPIRED we poll every 3s, because the
-        # official outcome is what we actually want to settle on.
-        #
-        # This used to be a flat 15s poll with `market` reset to None each tick, which
-        # meant that on the very tick where `expired` first became true `market` was
-        # almost always None -> no outcome prices -> the close-vs-open fallback below
-        # resolved and CLOSED the trade immediately. The "authoritative first" priority
-        # was therefore dead code, and every trade got scored against our own captured
-        # strike rather than Polymarket's published outcome. Caching the last fetched
-        # market on the trade and polling fast after expiry fixes that.
-        market = trade.get("_market")
-        poll_every = 3.0 if expired else 30.0
-        if trade.get("last_api_check", 0) < now_ts - poll_every:
+        # Always poll the market (throttled ~15s) so we can read the AUTHORITATIVE
+        # Polymarket resolution even after the local clock says the window expired.
+        market = None
+        if trade.get("last_api_check", 0) < now_ts - 15:
             try:
-                fetched = await data.fetch_market_by_slug(trade["market_slug"])
+                market = await data.fetch_market_by_slug(trade["market_slug"])
             except Exception:
-                fetched = None
+                market = None
             trade["last_api_check"] = now_ts
-            if fetched is not None:
-                market = fetched
-                trade["_market"] = fetched
-                trade["_market_closed"] = bool(fetched.get("closed"))
+            if market is not None:
+                trade["_market_closed"] = bool(market.get("closed"))
         market_closed = trade.get("_market_closed", False)
 
-        # Still live: window running and market still open -> keep waiting.
+        # Still live: window running and market still open → keep waiting.
         if not expired and not market_closed:
             remaining_active.append(trade)
             continue
@@ -1072,21 +779,10 @@ async def update_trades(current_prices: Dict[str, Any]):
 
         winning_index = -1
         resolution = None
-        # 1) Authoritative: a RESOLVED Polymarket outcome is marked at $1.
-        #
-        # `outcomePrices` on an OPEN market is the last traded price, not a result. The
-        # cached market can be up to 30s old (the pre-expiry poll interval), so on the
-        # first expired tick this used to read a still-trading book — and a live
-        # favourite above 90c is not a resolution. It loses often enough to matter
-        # (~1 market in 15 at these odds), and three trades in a 113-trade paper run
-        # were settled against the wrong side that way, crediting $4,163 that was never
-        # won. Require the market to actually be closed, and require a resolved mark
-        # (>= 0.99) rather than merely a strong favourite.
-        resolved = market_closed or str(
-            (market or {}).get("umaResolutionStatus", "")).lower() == "resolved"
-        for i, p in enumerate(outcome_prices if resolved else []):
+        # 1) Authoritative: a settled Polymarket outcome trades at ~$1.
+        for i, p in enumerate(outcome_prices):
             try:
-                if float(p) >= 0.99:
+                if float(p) > 0.9:
                     winning_index = i
                     resolution = "polymarket_settled"
                     break
@@ -1094,36 +790,16 @@ async def update_trades(current_prices: Dict[str, Any]):
                 pass
 
         # 2) Fallback once the window/market is over: frozen CLOSE vs STRIKE (open).
-        # Both are Chainlink values now, so this mirrors how Polymarket resolves —
-        # did the close finish above or below the open?
-        #
-        # Only used AFTER giving Polymarket AUTHORITATIVE_SETTLE_WAIT_S to publish its
-        # own outcome: our strike is a best-effort snapshot, theirs is the truth.
-        strike = trade.get("strike_price")   # the marked OPEN
+        # Both are Chainlink (Polymarket WS) values, so this mirrors how Polymarket
+        # resolves: did the close finish above or below the open?
+        strike = trade.get("strike_price")  # the marked OPEN
         settlement_price = (trade.get("close_price") or trade.get("settlement_price_at_expiry")
-                            or trade.get("last_price") or cur_price)   # the frozen CLOSE
+                            or trade.get("last_price") or cur_price)  # the frozen CLOSE
         if winning_index == -1 and (expired or market_closed):
-            if trade.get("expired_at") is None:
-                trade["expired_at"] = now_ts
-            waited = now_ts - trade["expired_at"]
-            # Wait the full window on TIME alone. `closed` can flip before UMA publishes
-            # the final $1/$0 marks, so the old `and not market_closed` shortcut could
-            # skip the wait in exactly the seconds the official result was about to
-            # land, and score the trade against our own strike snapshot instead.
-            #
-            # Measured over 2,879 markets (2026-07-21..08-19), resolution lands a median
-            # of 52s after expiry, p90 87s, p99 151s. So the 90s default already misses
-            # the official result on ~2.8% of markets and falls back to close_vs_open;
-            # 180s covers 99.2%. Raise `authoritative_settle_wait_s` if you would rather
-            # hold the trade slot longer than score against our own strike snapshot.
-            if waited < settings.AUTHORITATIVE_SETTLE_WAIT_S:
-                remaining_active.append(trade)   # keep waiting for the official result
-                continue
             if strike and settlement_price:
                 trade["settlement_price_at_expiry"] = settlement_price
                 winning_index = up_index if settlement_price > strike else down_index
                 resolution = "close_vs_open"
-                trade["settle_wait_s"] = round(waited, 1)
 
         # ---- Could not resolve yet ----
         if winning_index == -1:
@@ -1142,7 +818,7 @@ async def update_trades(current_prices: Dict[str, Any]):
             trade["profit_loss"] = 0.0
             if trade.get("mode", "paper") == "paper":
                 state["paper_balance"] += trade["amount"]  # refund the stake
-            state["trade_history"].append(_archive(trade))
+            state["trade_history"].append(trade)
             trades_changed = True
             log_message(f"VOID: Trade for {trade['market_slug']} unresolved past grace; stake refunded (paper).")
             continue
@@ -1151,8 +827,8 @@ async def update_trades(current_prices: Dict[str, Any]):
         won = ((trade["side"] == "UP" and winning_index == up_index) or
                (trade["side"] == "DOWN" and winning_index == down_index))
 
-        # Open/close context — recorded and shown in the log so the direction (and why
-        # that side won) is always visible after the fact.
+        # Open/close context — record it and show it in the log so the direction
+        # (and which side that made win) is always visible.
         open_px = strike
         close_px = trade.get("close_price") or settlement_price
         trade["open_price"] = open_px
@@ -1171,29 +847,122 @@ async def update_trades(current_prices: Dict[str, Any]):
             if trade.get("mode", "paper") == "paper":
                 state["paper_balance"] += payout
             trade["profit_loss"] = payout - trade["amount"]
-            log_message(f"WIN: {trade['side']} on {trade['market_slug']}: {dir_txt} "
-                        f"[{trade['resolution']}]. Profit: ${trade['profit_loss']:.2f}")
-            # A winning LIVE position is still a CTF token worth $1 — it does not
-            # become spendable pUSD on its own. Redeem it, or the balance silently
-            # under-reports and the capital strands.
-            if trade.get("mode") == "live":
-                await _redeem_win(trade, market, up_index, down_index, winning_index)
+            result = "WIN"
         else:
             trade["profit_loss"] = -trade["amount"]
-            log_message(f"LOSS: {trade['side']} on {trade['market_slug']}: {dir_txt} "
-                        f"[{trade['resolution']}]. Loss: ${trade['profit_loss']:.2f}")
+            result = "LOSS"
+
+        log_message(f"{result} [{resolution or 'unknown'}] {trade['side']}: {dir_txt} -> P/L ${trade['profit_loss']:.2f} ({trade['market_slug']})")
 
         trade["status"] = "CLOSED"
-        trade["exit_reason"] = trade.get("exit_reason") or "settled"
+        trade["exit_reason"] = "settled"
         trade["exit_time"] = datetime.now().isoformat()
         trade["settlement_price_at_expiry"] = trade.get("settlement_price_at_expiry") or settlement_price
         trade["winning_outcome"] = outcomes[winning_index] if 0 <= winning_index < len(outcomes) else None
-        state["trade_history"].append(_archive(trade))
+        state["trade_history"].append(trade)
         trades_changed = True
 
     state["active_trades"] = remaining_active
     if trades_changed:
         save_state()
+
+async def maybe_auto_withdraw(equity: Optional[float], poly_snapshot: Dict[str, Any]):
+    """Auto-withdrawal (capital extractor) state machine — LIVE mode only.
+
+        ARMED --(EQUITY >= trigger)--> WAITING_FLAT --(close any open trade, go flat)-->
+        WITHDRAWING --(submitted)--> WITHDRAW_SUBMITTED --> ARMED
+
+    The trigger uses **equity** (cash + the value of any open position), so a running
+    trade still counts toward the threshold. If a trade is open when the trigger fires,
+    it is CLOSED IMMEDIATELY (sold at the bid) so the balance settles into cash.
+
+    After the withdrawal:
+      - auto_resume ON  -> trading resumes at the NEXT 15m market (this one is locked).
+      - auto_resume OFF -> the bot is STOPPED entirely.
+    """
+    if state["trading_mode"] != "live" or not settings.AUTO_WITHDRAW_ENABLED:
+        if state["withdraw_state"] != "ARMED":   # disabled → never keep entries paused
+            state["withdraw_state"] = "ARMED"
+        return
+
+    st = state["withdraw_state"]
+    cash = state["paper_balance"]  # live pUSD balance is mirrored here
+
+    if st == "ARMED":
+        # Trigger on EQUITY, not just cash — so an open trade counts toward it.
+        if equity is not None and equity >= settings.WITHDRAW_TRIGGER_BALANCE:
+            state["withdraw_state"] = "WAITING_FLAT"
+            state["withdraw_flat_since"] = None
+            log_message(f"Auto-withdraw: equity ${equity:.2f} >= ${settings.WITHDRAW_TRIGGER_BALANCE:.2f} "
+                        f"→ pausing entries and closing any open trade")
+
+    elif st == "WAITING_FLAT":
+        # Close the open position immediately so the funds settle into cash.
+        if state["active_trades"]:
+            res = await close_open_position(poly_snapshot, "withdraw_close")
+            if res:
+                log_message(f"Auto-withdraw: closed {res['side']} @ {res['exit_price']:.2f} "
+                            f"(P/L ${res['pl']:.2f}) to go flat")
+                state["withdraw_flat_since"] = time.time()
+                state["last_balance_refresh"] = 0   # re-read the on-chain balance next tick
+            return
+        # Flat — give the sell a moment to settle on-chain before reading the balance.
+        if state.get("withdraw_flat_since") is None:
+            state["withdraw_flat_since"] = time.time()
+            state["last_balance_refresh"] = 0
+            return
+        if time.time() - state["withdraw_flat_since"] < 5:
+            return
+        state["withdraw_flat_since"] = None
+        state["withdraw_state"] = "WITHDRAWING"
+        log_message("Auto-withdraw: account is flat → withdrawing")
+
+    elif st == "WITHDRAWING":
+        # Destination: the user-set address, or fall back to your own wallet (the EOA
+        # derived from the key/seed) when left blank.
+        recipient = settings.WITHDRAW_ADDRESS or clob_trader.get_eoa_address()
+        if not recipient:
+            log_message("Auto-withdraw aborted: no wallet/key available. Disarming.")
+            state["withdraw_state"] = "ARMED"
+            return
+        amount = min(float(settings.WITHDRAW_AMOUNT), float(cash or 0))
+        if amount <= 0:
+            log_message("Auto-withdraw aborted: no cash balance to withdraw. Disarming.")
+            state["withdraw_state"] = "ARMED"
+            return
+        result = await asyncio.to_thread(clob_trader.withdraw_pusd, recipient, amount)
+        if result.get("ok"):
+            when = datetime.now()
+            tx = result.get("tx")
+            state["last_withdrawal"] = {"amount": result.get("amount"), "tx": tx,
+                                        "to": result.get("recipient"), "time": when.isoformat()}
+            state["withdraw_state"] = "WITHDRAW_SUBMITTED"
+            log_message(f"Auto-withdraw: submitted ${amount:.2f} → {recipient} (tx {tx})")
+            # Telegram alert: a withdrawal happened — time + amount.
+            await send_telegram(
+                "💸 <b>Withdrawal completed</b>\n"
+                f"Amount: <b>${amount:.2f}</b>\n"
+                f"Time: {when.strftime('%Y-%m-%d %H:%M:%S')}\n"
+                f"To: <code>{recipient}</code>"
+                + (f"\nTx: <code>{tx}</code>" if tx else "")
+            )
+        else:
+            log_message(f"Auto-withdraw FAILED: {result.get('error')}. Disarming.")
+            state["withdraw_state"] = "ARMED"
+
+    elif st == "WITHDRAW_SUBMITTED":
+        state["last_balance_refresh"] = 0  # fresh balance read so we don't re-trigger on a stale value
+        if not settings.WITHDRAW_AUTO_RESUME:
+            state["running"] = False
+            log_message("Auto-withdraw complete; auto-resume OFF → bot STOPPED.")
+        else:
+            # Resume, but not in the market we just exited — wait for the next 15m one.
+            mkt_id = str(poly_snapshot["market"].get("id")) if poly_snapshot.get("ok") else None
+            if mkt_id:
+                state["withdraw_locked_market"] = mkt_id
+            log_message("Auto-withdraw complete; trading resumes at the next 15m market.")
+        state["withdraw_state"] = "ARMED"
+
 
 async def seed_kline_buffers():
     try:
@@ -1207,145 +976,12 @@ async def seed_kline_buffers():
     except Exception as e:
         log_message(f"Failed to seed kline buffers: {e}")
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  Event-driven entry path
-#
-#  The 1 Hz loop stays the HOUSEKEEPING clock: indicators, strike marking,
-#  settlement, the withdrawal machine, logging, and publishing the dashboard
-#  snapshot. Those are either time-triggered (a window expires because time
-#  passed, not because a message arrived) or cheap enough not to matter.
-#
-#  The ENTRY DECISION does not wait for it. The whole thesis is acting on a gap
-#  between Binance spot and the Polymarket book, so the decision re-runs the
-#  moment either side of that gap moves — a Binance trade tick or a CLOB book
-#  update — instead of on a timer that could sit on a live edge for ~1s.
-#
-#  Both sides of the edge are already pushed, so this path does NO network I/O:
-#  it reads the in-memory spot and book, recomputes the fair probability against
-#  model parameters cached by the last housekeeping tick, and enters.
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _live_prices_from_ws(ctx) -> Optional[Dict[str, Any]]:
-    """Best asks + book summaries straight from the socket, or None if either side is
-    unusable. The event path never falls back to REST: a REST round trip here would
-    reintroduce exactly the latency this exists to remove, and the 1 Hz loop is already
-    covering the degraded case."""
-    tids = ctx.get("token_ids") or {}
-    up_id, down_id = tids.get("up"), tids.get("down")
-    if not up_id or not down_id:
-        return None
-    max_age = settings.MAX_BOOK_AGE_S
-    if not max_age:
-        return None
-    up = polymarket_clob_ws.get_summary(up_id, max_age_s=max_age)
-    down = polymarket_clob_ws.get_summary(down_id, max_age_s=max_age)
-    if not up or not down:
-        return None
-    if up.get("bestAsk") is None or down.get("bestAsk") is None:
-        return None
-    return {"prices": {"up": up["bestAsk"], "down": down["bestAsk"]},
-            "orderbook": {"up": up, "down": down}}
-
-
-async def evaluate_entry(trigger: str):
-    """Re-run the entry decision against live spot + live book. Entries only — a flip
-    is an exit decision on a position we already hold, and stays on the 1 Hz loop."""
-    global _last_eval_ts
-    ctx = state.get("trade_ctx") or {}
-    if not ctx:
-        return
-    now = time.time()
-    if now - _last_eval_ts < MIN_EVAL_INTERVAL_S:
-        return
-    if now - ctx.get("ts", 0) > CTX_MAX_AGE_S:
-        return                      # the housekeeping loop has stalled; don't trade blind
-    # Same gates the 1 Hz loop applies, checked before doing any work.
-    if not state["running"] or state["active_trades"]:
-        return
-    if state["withdraw_state"] != "ARMED":
-        return
-    if state.get("withdraw_locked_market") and \
-            state["withdraw_locked_market"] == str((ctx.get("market") or {}).get("id")):
-        return
-    if ctx.get("strike_open") is None or ctx.get("target_open") is None:
-        return
-
-    live = _live_prices_from_ws(ctx)
-    if not live:
-        return
-
-    spot = (binance_stream.get_last() or {}).get("price")
-    if not spot:
-        return
-
-    settlement_ms = ctx.get("settlement_ms")
-    time_left_min = ((settlement_ms - now * 1000) / 60_000) if settlement_ms else None
-    if time_left_min is not None and time_left_min <= 0:
-        return
-    steps = max(1, math.ceil((time_left_min if time_left_min is not None else 15) / 5))
-
-    fair_up = indicators.fair_prob_up(spot, ctx["target_open"], steps,
-                                      ctx.get("sigma_5m"), drift_per_step=ctx.get("drift_5m") or 0.0)
-
-    decision = engines.decide_ev({
-        "mcProbUp": fair_up,
-        "priceUp": live["prices"]["up"],
-        "priceDown": live["prices"]["down"],
-        "minProb": settings.MIN_PROB_EV,
-        "evThreshold": settings.EV_THRESHOLD,
-        "rsi": ctx.get("rsi"),
-        "haExhaustedGreen": ctx.get("ha_green"),
-        "haExhaustedRed": ctx.get("ha_red"),
-    })
-    _last_eval_ts = now
-    if decision["action"] != "ENTER":
-        return
-
-    async with _entry_lock:
-        if state["active_trades"] or not state["running"]:
-            return                  # won between the check above and the lock
-        result = await execute_trade(
-            decision, live["prices"], ctx["market"], ctx["strike_open"],
-            ctx.get("token_ids", {}), live["orderbook"],
-            strike_source=ctx.get("strike_source", "chainlink_ws"),
-            window_start_ms=ctx.get("window_start_ms"), open_reason="ev_entry")
-    if result == "entered":
-        # Hand the reason to the next CSV row so `signals.csv` still explains every
-        # entry — otherwise an between-ticks entry shows up only as `slot_busy`.
-        state["event_exec"] = f"entered_on_{trigger}"
-        log_message(f"Entered on {trigger} tick (event-driven, "
-                    f"{(now - ctx['ts']) * 1000:.0f}ms after the last housekeeping tick)")
-        # Reflect the new position on the dashboard now, not on the next tick — an
-        # entry taken between ticks is exactly the thing worth seeing immediately.
-        ts = state["latest_data"].get("trading_state")
-        if isinstance(ts, dict):
-            ts["active_trades"] = state["active_trades"]
-            ts["balance"] = state["paper_balance"]
-        await broadcast_state()
-    elif result not in (None, "slot_busy", "no_trade"):
-        state["event_exec"] = f"{result}_on_{trigger}"
-
-
-async def entry_watcher():
-    """One consumer for both streams. Waiting on an Event collapses a burst of trade
-    ticks and book frames into a single evaluation, so the cost is bounded no matter
-    how fast the feeds run."""
-    while True:
-        try:
-            await _market_event.wait()
-            _market_event.clear()
-            await evaluate_entry("book" if polymarket_clob_ws.connected else "spot")
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:
-            print(f"Entry watcher error: {e}")
-        await asyncio.sleep(MIN_EVAL_INTERVAL_S)
-
-
 async def update_loop():
     csv_header = [
         "timestamp", "entry_minute", "time_left_min", "signal",
         "model_up", "model_down", "mkt_up", "mkt_down", "edge_up", "edge_down",
+        # Chosen-side inputs on EVERY tick (even no-trade) so filters can be mined later:
+        "chosen_side", "chosen_prob", "chosen_price", "chosen_ev",
         "recommendation", "reason", "exec_result"
     ]
 
@@ -1377,62 +1013,14 @@ async def update_loop():
 
             spot_price = binance_ws.get("price") if binance_ws and binance_ws.get("price") else last_price
 
-            mc_steps = max(1, math.ceil(timing["remainingMinutes"] / 5))
+            mc_steps = max(1, __import__('math').ceil(timing["remainingMinutes"] / 5))
 
-            # ── The settlement feed ──────────────────────────────────────────────
-            # Prefer Polymarket's OWN Chainlink WS: it is the exact stream Polymarket
-            # settles on, so marking the open and the close from it matches the market
-            # most faithfully. Fall back to the direct Chainlink RPC WS, then REST.
-            # A stream's get_last() returns whatever it saw LAST, which after a dropped
-            # connection or a quiet feed can be minutes old. Preferring it purely on
-            # "has a price" latched stale values as the strike: measured against
-            # Polymarket's own recorded oracle series over 113 live trades, the marked
-            # open was never the tick at eventStartTime — median $8.30 out (1.05 bps),
-            # worst $86 — and best-matched a tick a median of 22s BEFORE the window
-            # opened. Each source carries `updatedAt`; honour it and fall through to the
-            # next source when the value is stale.
-            # The two feeds mean different things by `updatedAt`, so they get different
-            # limits. Polymarket's stream carries the tick's own time and ticks ~1/s, so
-            # anything older than POLY_WS_MAX_AGE_MS means the socket is dead. The RPC
-            # sources report the on-chain ROUND timestamp, which is legitimately old
-            # between aggregator posts — there the limit is only a liveness check.
-            now_ms_feed = time.time() * 1000
-
-            def _age_ok(snap, max_age_ms):
-                px = (snap or {}).get("price")
-                if not px:
-                    return None
-                ts = (snap or {}).get("updatedAt")
-                if ts and (now_ms_feed - float(ts)) > max_age_ms:
-                    return None
-                return px
-
-            sources = ((poly_ws, "Polymarket WS", POLY_WS_MAX_AGE_MS),
-                       (cl_ws, "Chainlink RPC WS", ONCHAIN_MAX_AGE_MS),
-                       (chainlink_data, "Chainlink RPC REST", ONCHAIN_MAX_AGE_MS))
-
-            current_price = None
-            price_source = None
-            price_is_fresh = False
-            for snap, label, max_age in sources:
-                px = _age_ok(snap, max_age)
-                if px:
-                    current_price, price_source, price_is_fresh = px, label, True
-                    break
-            if current_price is None:
-                # Every feed is stale. Carry the freshest value we have so the dashboard
-                # still shows something, but flag it so no strike is latched from it.
-                for snap, label, _ in sources:
-                    if (snap or {}).get("price"):
-                        current_price, price_source = snap["price"], label + " (STALE)"
-                        break
-
-            # ── Authoritative window start = the market's own eventStartTime ──────
+            # ── Authoritative window start = the market's eventStartTime ──────────
             # NOT the local aligned clock. eventStartTime is the exact second the
-            # contract's "Price to Beat" is fixed, so a feed value captured at that
-            # instant matches Polymarket's settlement. Fall back to endDate - window,
-            # then the local boundary. (Polymarket exposes no numeric strike field —
-            # the strike IS the Chainlink price at eventStartTime.)
+            # contract's "Price to Beat" (strike) is fixed, so a feed value captured
+            # at that instant matches Polymarket's settlement. Fall back to
+            # endDate - window, then the local aligned boundary. (Polymarket exposes
+            # no numeric strike field — it's the Chainlink price at eventStartTime.)
             window_ms = settings.CANDLE_WINDOW_MINUTES * 60_000
             event_start_ms = None
             if poly_snapshot.get("ok"):
@@ -1451,39 +1039,69 @@ async def update_loop():
             if event_start_ms is None:
                 event_start_ms = int(timing["startMs"])
 
-            # ── Mark this window's OPEN at eventStartTime ─────────────────────────
-            # Two values are captured at the same instant:
-            #   "chainlink" -> the SETTLEMENT strike (what Polymarket resolves against)
-            #   "binance"   -> the MODEL's reference open, so fair_prob keeps measuring
-            #                  the Binance move since the open exactly as it always has.
-            # Mixing the two feeds would inject a constant ~0.13% offset into the model.
-            start_ms = event_start_ms
-            win = mark_window_open(start_ms, window_ms, current_price, spot_price,
-                                   price_source, price_is_fresh)
+            current_price = None
+            price_source = None
 
-            # Settlement strike for a trade entered now: ONLY the Chainlink open latched
-            # at eventStartTime. None until/unless captured => no trade this window.
-            strike_open = win["chainlink"]
+            # Prefer Polymarket's OWN Chainlink WS feed — it's the exact price stream
+            # Polymarket settles on, so marking open/close from it matches the market
+            # most faithfully. Fall back to the direct Chainlink RPC WS, then REST.
+            if poly_ws.get("price"):
+                current_price = poly_ws["price"]
+                price_source = "Polymarket WS"
+            elif cl_ws.get("price"):
+                current_price = cl_ws["price"]
+                price_source = "Chainlink RPC WS"
+            elif chainlink_data.get("price"):
+                current_price = chainlink_data["price"]
+                price_source = "Chainlink RPC REST"
+
+            # ── Mark this window's OPEN (strike) from the feed at eventStartTime ──
+            # We snapshot the Chainlink feed value at the market's real start second,
+            # then compare the Chainlink price at expiry against it (see update_trades).
+            # Open and close come from the SAME feed, keyed to the market's own clock —
+            # so the near-the-money "mistakes" from local-clock skew disappear.
+            start_ms = event_start_ms
+            opens = state["market_opens"]
+            prev_ws = state.get("last_window_start")
+            # When the window rolls over, freeze the PRIOR window's CLOSE = the last
+            # Chainlink price we saw in it, so every trade there has a true close.
+            if prev_ws is not None and prev_ws != start_ms and prev_ws in opens:
+                if opens[prev_ws].get("close") is None and state.get("last_seen_price"):
+                    opens[prev_ws]["close"] = state["last_seen_price"]
+            if current_price:
+                state["last_seen_price"] = current_price
+            # "genuine" == we were already running in the immediately-preceding window,
+            # so the first price we see in this one really is its open.
+            observed_prev = prev_ws is not None and abs((start_ms - window_ms) - prev_ws) < 2000
+            if start_ms not in opens:
+                opens[start_ms] = {"chainlink": None, "close": None, "genuine": observed_prev}
+                for k in list(opens.keys()):           # prune old windows
+                    if k < start_ms - 4 * window_ms:
+                        del opens[k]
+            win = opens[start_ms]
+            if (win["chainlink"] is None and win["genuine"] and current_price
+                    and (time.time() * 1000 - start_ms) < 20_000):
+                win["chainlink"] = current_price        # strike, captured at eventStartTime
+                log_message(f"Window open marked @ eventStartTime (Chainlink): {current_price:.2f} @ {price_source}")
+            state["last_window_start"] = start_ms
+
+            # Strike (open) for a trade entered now: ONLY the Chainlink open captured
+            # at eventStartTime. If we didn't capture it (bot wasn't running at the
+            # boundary), strike_open stays None and NO trade opens this window.
+            chainlink_open = win["chainlink"]
+            strike_open = chainlink_open          # None until/unless captured
             strike_source = "chainlink_ws"
 
-            # Model reference open. Prefer the 5m candle that opens EXACTLY at the
-            # window start (strict equality — a `<=` scan silently picks the previous
-            # candle's open in the first seconds of a window, before the new one has
-            # arrived over the WS). Fall back to the Binance spot latched at the mark.
-            model_open = None
-            for c in reversed(klines_5m):
-                if c["openTime"] == start_ms:
-                    model_open = c["open"]
-                    break
-                if c["openTime"] < start_ms:
-                    break
-            model_open = model_open or win.get("binance")
-            target_open = model_open if strike_open is not None else None
+            # Model's fair-prob strike = the SAME authoritative open (Chainlink at
+            # eventStartTime). NO Binance/spot fallback — if this window's real open
+            # wasn't captured, target_open stays None: the fair prob is neutral and no
+            # trade opens, rather than scoring against a wrong reference.
+            target_open = strike_open
 
             # Fast closed-form fair probability (replaces 1000-sim Monte Carlo —
             # backtest-verified equivalent, ~1000x cheaper, which a latency play needs).
             drift_5m, sigma_5m = indicators.realized_drift_vol(klines_5m, lookback=300)
-            fair_up = indicators.fair_prob_up(spot_price or 0, target_open or 0, mc_steps, sigma_5m, drift_per_step=drift_5m or 0.0)
+            fair_up = indicators.fair_prob_up((current_price or spot_price) or 0, target_open or 0, mc_steps, sigma_5m, drift_per_step=drift_5m or 0.0)
             fair_data = {
                 "prob_up": fair_up,
                 "prob_down": 1.0 - fair_up,
@@ -1498,23 +1116,22 @@ async def update_loop():
 
             time_left_min = (settlement_ms - time.time() * 1000) / 60_000 if settlement_ms else timing["remainingMinutes"]
 
-            closes = [c["close"] for c in klines_1m]
-            rsi_now = indicators.compute_rsi(closes, settings.RSI_PERIOD)
-
-            # Heiken-Ashi streaks (1m & 5m) — the exhaustion veto.
-            consec = indicators.count_consecutive(indicators.compute_heiken_ashi(klines_1m))
-            consec_5m = {"color": None, "count": 0}
-            if len(klines_5m) >= 20:
-                consec_5m = indicators.count_consecutive(indicators.compute_heiken_ashi(klines_5m))
-
+            # EV / execution uses the ASK (what a BUY actually costs).
             market_up = poly_snapshot["prices"]["up"] if poly_snapshot["ok"] else None
             market_down = poly_snapshot["prices"]["down"] if poly_snapshot["ok"] else None
+            # Displayed "Polymarket Odds" = the real-time book MIDPOINT (matches the site).
+            poly_odds = poly_snapshot.get("odds", {}) if poly_snapshot.get("ok") else {}
+            odds_up = poly_odds.get("up")
+            odds_down = poly_odds.get("down")
 
             # ── LATENCY EDGE ─────────────────────────────────────────────────────
             # Our fast Binance-derived fair prob vs the market's (possibly stale)
-            # implied prob. A positive edge = the book hasn't repriced the move yet.
+            # implied prob. The implied prob shown to the user is the MIDPOINT odds
+            # (what Polymarket displays), not the ask we transact at.
             market_implied_up = None
-            if market_up is not None and market_down is not None and (market_up + market_down) > 0:
+            if odds_up is not None and odds_down is not None and (odds_up + odds_down) > 0:
+                market_implied_up = odds_up / (odds_up + odds_down)
+            elif market_up is not None and market_down is not None and (market_up + market_down) > 0:
                 market_implied_up = market_up / (market_up + market_down)
             edge = {
                 "marketUp": market_implied_up,
@@ -1524,179 +1141,161 @@ async def update_loop():
             }
             prob_view = {"adjustedUp": fair_up, "adjustedDown": 1 - fair_up}
 
-            # Heiken-Ashi exhaustion veto (>=6 bars in one direction = don't chase).
-            EB = engines.EXHAUSTION_BARS
-
-            def _is(color, count, want):
-                return color == want and (count or 0) >= EB
-
-            ha_exhausted_green = _is(consec["color"], consec["count"], "green") or _is(consec_5m["color"], consec_5m["count"], "green")
-            ha_exhausted_red = _is(consec["color"], consec["count"], "red") or _is(consec_5m["color"], consec_5m["count"], "red")
-
             decision = engines.decide_ev({
                 "mcProbUp": fair_up,
                 "priceUp": market_up,
                 "priceDown": market_down,
                 "minProb": settings.MIN_PROB_EV,
                 "evThreshold": settings.EV_THRESHOLD,
-                "rsi": rsi_now,
-                "haExhaustedGreen": ha_exhausted_green,
-                "haExhaustedRed": ha_exhausted_red,
             })
 
             current_prices_dict = {"spot": spot_price, "chainlink": current_price}
 
-            # Clear the post-withdrawal market lock once the window has rolled on.
-            cur_market_id = str(poly_snapshot["market"].get("id")) if poly_snapshot["ok"] else None
-            if state.get("withdraw_locked_market") and cur_market_id and \
-                    state["withdraw_locked_market"] != cur_market_id:
+            exec_result = None
+            flip_side = None
+            tp_sl_hit = None
+
+            # Clear the market locks (take-profit/stop-loss and post-withdrawal) once the
+            # window has rolled to a new market, so the next 15m window can trade again.
+            cur_market_id = str(poly_snapshot["market"].get("id")) if poly_snapshot.get("ok") else None
+            if state.get("tp_sl_locked_market") and cur_market_id and state["tp_sl_locked_market"] != cur_market_id:
+                state["tp_sl_locked_market"] = None
+            if state.get("withdraw_locked_market") and cur_market_id and state["withdraw_locked_market"] != cur_market_id:
                 state["withdraw_locked_market"] = None
 
-            # Entries and flips run ONLY when the user has pressed Start, no withdrawal
-            # is in flight, and this isn't the market a withdrawal just exited. Feeds,
-            # the model and settlement all keep running either way, so an open position
-            # always settles to expiry and can never get stranded by a Stop.
-            withdraw_locked = (state.get("withdraw_locked_market") is not None
-                               and state["withdraw_locked_market"] == cur_market_id)
+            # Take-profit / stop-loss runs first (even mid-withdrawal we still want to
+            # honour an exit), and closing locks the market against re-entry this window.
+            if poly_snapshot["ok"] and state["running"]:
+                tp_sl_hit = await maybe_tp_sl(poly_snapshot)
+
+            # Entries/flips run only when STARTED, no withdrawal pending, this market is
+            # not locked (by TP/SL or by a just-completed withdrawal), and TP/SL didn't
+            # just fire this tick.
+            tp_sl_locked = state.get("tp_sl_locked_market") is not None and state["tp_sl_locked_market"] == cur_market_id
+            withdraw_locked = state.get("withdraw_locked_market") is not None and state["withdraw_locked_market"] == cur_market_id
             entries_allowed = (state["running"] and state["withdraw_state"] == "ARMED"
-                               and not withdraw_locked)
-
-            # Publish everything the event path needs to decide without any network I/O.
-            # The model parameters (sigma/drift/RSI/HA) change on candle boundaries, not
-            # on ticks, so caching them here and recomputing only the fast-moving parts
-            # (spot, book, time left) is exact rather than an approximation.
-            if poly_snapshot["ok"]:
-                state["trade_ctx"] = {
-                    "ts": time.time(),
-                    "market": poly_snapshot["market"],
-                    "token_ids": poly_snapshot.get("token_ids", {}),
-                    "strike_open": strike_open,
-                    "strike_source": strike_source,
-                    "target_open": target_open,
-                    "window_start_ms": start_ms,
-                    "settlement_ms": settlement_ms,
-                    "sigma_5m": sigma_5m,
-                    "drift_5m": drift_5m,
-                    "rsi": rsi_now,
-                    "ha_green": ha_exhausted_green,
-                    "ha_red": ha_exhausted_red,
-                }
-            else:
-                state["trade_ctx"] = {}
-
-            exec_result = None
+                               and not tp_sl_locked and not withdraw_locked and not tp_sl_hit)
             if poly_snapshot["ok"] and entries_allowed:
-                flipped = await maybe_flip_position(decision, poly_snapshot, time_left_min)
-                # NOTE: the trade is stamped with `strike_open` (Chainlink @ eventStartTime),
-                # NOT `target_open` (the model's Binance reference). Settlement compares a
-                # Chainlink close to this, so both sides must come from the same feed.
-                # Same lock the event path takes — otherwise the slot check and the
-                # append can interleave between the two and open two positions.
-                async with _entry_lock:
-                    exec_result = await execute_trade(
-                        decision, poly_snapshot["prices"], poly_snapshot["market"], strike_open,
-                        poly_snapshot.get("token_ids", {}), poly_snapshot.get("orderbook", {}),
-                        strike_source=strike_source, window_start_ms=start_ms,
-                        open_reason="flip_entry" if flipped else "ev_entry")
+                flip_side = await maybe_flip_position(fair_up, poly_snapshot, time_left_min, strike_open, strike_source)
+                exec_result = await execute_trade(decision, poly_snapshot["prices"], poly_snapshot["market"], strike_open, poly_snapshot.get("token_ids", {}), poly_snapshot.get("orderbook", {}), strike_source)
             elif not state["running"]:
                 exec_result = "stopped"
-            elif state["withdraw_state"] != "ARMED":
-                exec_result = f"withdraw_{state['withdraw_state'].lower()}"
+            elif tp_sl_hit:
+                exec_result = tp_sl_hit
+            elif tp_sl_locked:
+                exec_result = "tp_sl_locked"
             elif withdraw_locked:
                 exec_result = "withdraw_locked"
 
             await update_trades(current_prices_dict)
 
-            # Mark open positions to market so the dashboard can show live P/L.
+            # ── Mark-to-market: value each OPEN position at the current bid of its
+            # held side (what you'd get selling right now) and roll it into equity so
+            # the headline number doesn't just drop by the stake on entry.
             open_value = 0.0
+            snap_ob = poly_snapshot.get("orderbook", {}) if poly_snapshot.get("ok") else {}
+            snap_market_id = str(poly_snapshot["market"].get("id")) if poly_snapshot.get("ok") else None
             for t in state["active_trades"]:
-                mark = None
-                if poly_snapshot["ok"] and str(t.get("market_id")) == str(poly_snapshot["market"].get("id")):
-                    ob = (poly_snapshot.get("orderbook") or {}).get("up" if t["side"] == "UP" else "down") or {}
-                    mark = ob.get("bestBid") or (market_up if t["side"] == "UP" else market_down)
-                if mark:
-                    t["mark_price"] = mark
-                    t["unrealized_pl"] = (t["shares"] * mark) - t["amount"]
-                    open_value += t["shares"] * mark
-                else:
-                    t["unrealized_pl"] = None
-                    open_value += t["amount"]   # no quote — carry at cost
+                held_key = "up" if t["side"] == "UP" else "down"
+                # Only trust the live book if this trade is in the market we just snapshotted.
+                if snap_market_id is not None and str(t.get("market_id")) == snap_market_id:
+                    bid = (snap_ob.get(held_key) or {}).get("bestBid")
+                    if bid and bid > 0:
+                        t["cur_bid"] = bid
+                mark = t.get("cur_bid") or t.get("entry_price")  # fall back to entry (neutral) until we see a bid
+                t["unrealized_pl"] = (t["shares"] * mark) - t["amount"]
+                open_value += t["shares"] * mark
+            equity = state["paper_balance"] + open_value
 
-            # In live mode, reflect the real on-chain USDC balance in the dashboard
+            # ── Backfill the market OUTCOME onto flip-closed trades ──────────────
+            # A flip books its P/L on the early-exit sell, so a side can show a loss
+            # even though the market later resolves in its favour. Once that window's
+            # CLOSE is known, score each flipped-out side against the true open→close
+            # so the history shows whether the market actually went its way.
+            backfilled = False
+            for h in state["trade_history"]:
+                if h.get("exit_reason") != "flip" or h.get("market_won") is not None:
+                    continue
+                ws = h.get("window_start_ms")
+                winfo = opens.get(ws) if ws is not None else None
+                close_px = winfo.get("close") if winfo else None
+                open_px = h.get("open_price") or h.get("strike_price")
+                if close_px is not None and open_px:
+                    h["close_price"] = close_px
+                    h["market_won"] = (("UP" if close_px > open_px else "DOWN") == h["side"])
+                    backfilled = True
+            if backfilled:
+                save_state()
+
+            # In live mode, reflect the real on-chain pUSD balance in the dashboard
+            # (refreshed ~10s so the header balance tracks near-realtime).
             if state["trading_mode"] == "live":
                 now_ts = time.time()
-                if now_ts - state.get("last_balance_refresh", 0) > 30:
+                if now_ts - state.get("last_balance_refresh", 0) > 10:
                     real_bal = await asyncio.to_thread(clob_trader.get_usdc_balance)
                     if real_bal is not None:
                         state["paper_balance"] = real_bal
                     state["last_balance_refresh"] = now_ts
+                    equity = state["paper_balance"] + open_value  # keep equity in step with the fresh balance
+                # Auto-withdrawal (capital extractor) — triggers on EQUITY (cash + open
+                # position value), force-closes any open trade, withdraws, then resumes
+                # at the next market (or stops the bot if auto-resume is off).
+                await maybe_auto_withdraw(equity, poly_snapshot)
 
-            # Auto-withdrawal (capital extractor) — triggers on EQUITY (cash + open
-            # position value), force-closes any open trade, withdraws, then resumes at
-            # the next window. Runs AFTER the balance refresh so it decides on a
-            # current number, and after settlement so a just-closed win is counted.
-            equity = state["paper_balance"] + open_value
-            await maybe_auto_withdraw(equity, poly_snapshot)
-            # A withdrawal may have just sold the position out. `open_value` was marked
-            # before that, so drop it rather than showing the equity tile a position
-            # that no longer exists for one tick.
-            if not state["active_trades"]:
-                open_value = 0.0
-
-            # An entry that happened BETWEEN ticks would otherwise show up here only as
-            # `slot_busy`, with nothing saying why. The event path leaves its reason for
-            # this row so signals.csv keeps explaining every entry.
-            if state.get("event_exec"):
-                exec_result = state["event_exec"]
-                state["event_exec"] = None
-
-            signal_label = f"BUY {decision['side']}" if decision["action"] == "ENTER" else "NO TRADE"
+            # A flip opens a position independently of the EV signal — surface it so
+            # a flip tick never reads as a bare "NO TRADE".
+            if flip_side:
+                signal_label = f"FLIP {flip_side}"
+                exec_result = f"flipped_to_{flip_side}"
+            else:
+                signal_label = f"BUY {decision['side']}" if decision["action"] == "ENTER" else "NO TRADE"
             utils.append_csv_row("./logs/signals.csv", csv_header, [
                 datetime.now().isoformat(), timing["elapsedMinutes"], time_left_min,
                 signal_label, fair_up, 1 - fair_up, market_up, market_down,
-                edge["edgeUp"], edge["edgeDown"], f"{decision['side']}:{decision['phase']}:{decision['strength']}" if decision["action"] == "ENTER" else "NO_TRADE",
+                edge["edgeUp"], edge["edgeDown"],
+                # chosen-side prob/price/ev — present on ENTER and NO_TRADE alike
+                decision.get("side"), decision.get("prob"), decision.get("price"), decision.get("ev"),
+                f"{decision['side']}:{decision['phase']}:{decision['strength']}" if decision["action"] == "ENTER" else "NO_TRADE",
                 decision.get("reason", ""), exec_result or ""
             ])
 
             state["latest_data"] = {
                 "timestamp": datetime.now().isoformat(),
-                "log_seq": state["log_seq"],
                 "timing": timing,
                 "market": poly_snapshot.get("market") if poly_snapshot["ok"] else None,
                 "trading_state": {
                     "mode": state["trading_mode"],
-                    "running": state["running"],
-                    "balance": state["paper_balance"],
-                    "equity": state["paper_balance"] + open_value,
-                    "open_value": open_value,
+                    "balance": state["paper_balance"],     # cash only
+                    "open_value": open_value,              # mark-to-market value of open positions
+                    "equity": equity,                      # cash + open position value
                     "active_trades": state["active_trades"],
                     "history_count": len(state["trade_history"]),
                     "risk": {"type": settings.RISK_TYPE, "value": settings.RISK_VALUE},
                     "symbol": settings.SYMBOL,
+                    "running": state["running"],
                     "withdraw": {
                         "enabled": settings.AUTO_WITHDRAW_ENABLED,
                         "state": state["withdraw_state"],
                         "trigger_balance": settings.WITHDRAW_TRIGGER_BALANCE,
                         "amount": settings.WITHDRAW_AMOUNT,
                         "last": state["last_withdrawal"],
-                    }
+                    },
                 },
                 "prices": {
                     "spot": spot_price,
                     "chainlink": current_price,
                     "chainlink_source": price_source,
-                    "poly_up": market_up,
-                    "poly_down": market_down,
-                    "window_open": strike_open,          # strike: Chainlink @ eventStartTime
-                    "window_open_source": strike_source,
-                    "model_open": model_open,            # the model's Binance reference open
-                    "window_start_ms": start_ms,
-                    "book_source": poly_snapshot.get("book_source") if poly_snapshot["ok"] else None
+                    # Displayed "Polymarket Odds" = real-time book MIDPOINT (matches the site).
+                    "poly_up": odds_up if odds_up is not None else market_up,
+                    "poly_down": odds_down if odds_down is not None else market_down,
+                    # The executable ask (what a BUY costs) — used for EV/execution.
+                    "poly_up_ask": market_up,
+                    "poly_down_ask": market_down,
+                    "odds_source": "clob_ws_mid",
+                    "window_open": strike_open,          # this window's marked OPEN (strike @ eventStartTime)
+                    "window_open_source": strike_source  # "chainlink_ws" (Polymarket Chainlink at eventStartTime)
                 },
                 "indicators": {
-                    "rsi": rsi_now,
-                    "heiken": consec,
-                    "heiken_5m": consec_5m,
                     "fair": fair_data
                 },
                 "analysis": {
@@ -1704,7 +1303,6 @@ async def update_loop():
                 }
             }
             state["last_update_ts"] = time.time()
-            await broadcast_state()
 
         except Exception as e:
             print(f"Error in update loop: {e}")
@@ -1724,106 +1322,9 @@ async def get_settings_page(request: Request):
 async def get_latest():
     return state["latest_data"]
 
-
-@app.websocket("/ws")
-async def dashboard_ws(ws: WebSocket):
-    """Pushes the dashboard snapshot: on connect, on every rebuilt tick, and
-    immediately after a discrete event (an entry, Start/Stop).
-
-    `/api/latest` is unchanged and still works — the page falls back to polling it
-    whenever this socket is unavailable, so the dashboard degrades rather than dies.
-    """
-    await ws.accept()
-    try:
-        # Sent BEFORE joining the broadcast set: two coroutines writing the same
-        # websocket concurrently can interleave frames. The cost is that a snapshot
-        # rebuilt in this instant is missed, which the next tick corrects.
-        if state["latest_data"]:
-            await ws.send_json(state["latest_data"])
-        _ws_clients.add(ws)
-        while True:
-            # We expect nothing from the client; this is how a disconnect surfaces.
-            await ws.receive_text()
-    except Exception:
-        pass
-    finally:
-        _ws_clients.discard(ws)
-
 @app.get("/api/logs")
 async def get_logs():
     return state["logs"]
-
-# Data files the dashboard is allowed to download. An explicit whitelist, NOT a path
-# join on user input — this endpoint is reachable by anyone who can reach the
-# dashboard, so it must not be able to serve arbitrary files (private_key lives in
-# config.json).
-DOWNLOADABLE = {
-    "signals": ("logs/signals.csv", "text/csv"),
-    "trades": ("state_data.json", "application/json"),
-}
-
-
-@app.get("/api/files")
-async def list_files():
-    """Which data files exist, how big, and when they last changed."""
-    out = []
-    for key, (path, _) in DOWNLOADABLE.items():
-        exists = os.path.exists(path)
-        out.append({
-            "key": key,
-            "name": os.path.basename(path),
-            "exists": exists,
-            "size": os.path.getsize(path) if exists else 0,
-            "rows": (max(0, sum(1 for _ in open(path, encoding="utf-8", errors="ignore")) - 1)
-                     if exists and path.endswith(".csv") else None),
-            "modified": (datetime.fromtimestamp(os.path.getmtime(path)).isoformat()
-                         if exists else None),
-        })
-    return out
-
-
-@app.get("/api/download/{key}")
-async def download_file(key: str):
-    entry = DOWNLOADABLE.get(key)
-    if not entry:
-        return JSONResponse({"error": "unknown_file"}, status_code=404)
-    path, media = entry
-    if not os.path.exists(path):
-        return JSONResponse({"error": "not_generated_yet", "path": path}, status_code=404)
-    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    base, ext = os.path.splitext(os.path.basename(path))
-    return FileResponse(path, media_type=media, filename=f"15m-{base}-{stamp}{ext}")
-
-
-def _reflect_running_now():
-    """Mirror the running flag into latest_data immediately so /api/latest is in sync
-    on the very next poll (the update loop would otherwise lag ~1s, flickering the UI)."""
-    ts = state["latest_data"].get("trading_state")
-    if isinstance(ts, dict):
-        ts["running"] = state["running"]
-
-
-@app.post("/api/start")
-async def start_trading():
-    """Begin trading. Data/prices stream continuously; this flips the gate so the
-    engine may enter/flip trades."""
-    state["running"] = True
-    _reflect_running_now()
-    log_message("Trading STARTED by user")
-    await broadcast_state()
-    return {"ok": True, "running": True}
-
-
-@app.post("/api/stop")
-async def stop_trading():
-    """Stop all trading. New entries and flips halt immediately; any open position
-    keeps settling to expiry so it can't get stuck."""
-    state["running"] = False
-    _reflect_running_now()
-    log_message("Trading STOPPED by user")
-    await broadcast_state()
-    return {"ok": True, "running": False}
-
 
 @app.get("/api/available-series")
 async def get_available_series():
@@ -1831,21 +1332,23 @@ async def get_available_series():
 
 @app.get("/api/settings")
 async def get_settings():
-    def mask(v: str) -> str:
-        return v[:6] + "..." + v[-4:] if v and len(v) > 10 else v
-
-    masked_pk = mask(settings.PRIVATE_KEY)
+    pk = settings.PRIVATE_KEY
+    masked_pk = pk[:6] + "..." + pk[-4:] if pk and len(pk) > 10 else pk
 
     return {
         "mode": settings.MODE,
         "paper_balance_usd": settings.PAPER_BALANCE_USD,
         "private_key": masked_pk,
-        "live": {
-            # signature_type / funder are AUTO-DETECTED from the key under CLOB V2 —
-            # they are reported for visibility, not for editing.
-            "relayer_api_key": mask(settings.RELAYER_API_KEY),
-            "alchemy_api_key": mask(settings.ALCHEMY_API_KEY),
-            "max_slippage": settings.CLOB_MAX_SLIPPAGE
+        "relayer": {
+            "api_key": "set" if settings.RELAYER_API_KEY else ""
+        },
+        "capital_extractor": {
+            "enabled": settings.AUTO_WITHDRAW_ENABLED,
+            "trigger_balance": settings.WITHDRAW_TRIGGER_BALANCE,
+            "withdraw_amount": settings.WITHDRAW_AMOUNT,
+            "withdraw_address": settings.WITHDRAW_ADDRESS,
+            "auto_resume_after_withdrawal": settings.WITHDRAW_AUTO_RESUME,
+            "resume_after": settings.WITHDRAW_RESUME_AFTER
         },
         "polymarket": {
             "series_id": settings.POLYMARKET_SERIES_ID,
@@ -1870,19 +1373,17 @@ async def get_settings():
             "min_conviction": settings.FLIP_MIN_CONVICTION,
             "min_minutes_left": settings.FLIP_MIN_MINUTES_LEFT
         },
-        "capital_extractor": {
-            "enabled": settings.AUTO_WITHDRAW_ENABLED,
-            "trigger_balance": settings.WITHDRAW_TRIGGER_BALANCE,
-            "withdraw_amount": settings.WITHDRAW_AMOUNT,
-            "withdraw_address": settings.WITHDRAW_ADDRESS,
-            "auto_resume_after_withdrawal": settings.WITHDRAW_AUTO_RESUME,
-            "resume_after": settings.WITHDRAW_RESUME_AFTER
+        "tp_sl": {
+            "enabled": settings.TP_SL_ENABLED,
+            "take_profit_pct": settings.TAKE_PROFIT_PCT,
+            "stop_loss_pct": settings.STOP_LOSS_PCT
         },
         "telegram": {
             "enabled": settings.TELEGRAM_ENABLED,
-            # The token is never echoed back — the form shows "set" and POSTing that
-            # sentinel unchanged leaves the stored token alone.
             "bot_token": "set" if settings.TELEGRAM_BOT_TOKEN else ""
+        },
+        "chainlink": {
+            "alchemy_api_key": "set" if settings.ALCHEMY_API_KEY else ""
         }
     }
 
@@ -1891,22 +1392,23 @@ async def post_settings(new_settings: Dict[str, Any]):
     global binance_stream, polymarket_ws_stream, chainlink_ws_stream, binance_kline_1m, binance_kline_5m
     old_symbol = settings.SYMBOL
 
-    # "set" is the placeholder GET /api/settings returns for a stored bot token — it is
-    # not a token. Drop it so the deep-merge below can't overwrite the real one with it.
-    if isinstance(new_settings.get("telegram"), dict) and new_settings["telegram"].get("bot_token") == "set":
-        new_settings["telegram"].pop("bot_token", None)
-
     new_pk = new_settings.get("private_key")
     if new_pk and "..." in new_pk:
+        # masked value returned by GET — keep the stored key unchanged
         new_settings["private_key"] = settings.PRIVATE_KEY
-    elif new_pk:
-        # Accepts a hex key OR a 12/24-word seed phrase; stored as hex either way.
+    elif new_pk is not None:
         from bot.config import normalize_private_key
-        try:
-            settings.PRIVATE_KEY = normalize_private_key(new_pk)
-            new_settings["private_key"] = settings.PRIVATE_KEY
-        except Exception as e:
-            return {"status": "error", "error": f"invalid_private_key: {e}"}
+        settings.PRIVATE_KEY = normalize_private_key(new_pk)
+        new_settings["private_key"] = settings.PRIVATE_KEY  # persist the derived hex key, never the seed
+
+    # "set" is the masked sentinel returned by GET for stored secrets — if the form
+    # sends it back unchanged, don't overwrite the real key with the sentinel.
+    if isinstance(new_settings.get("relayer"), dict) and new_settings["relayer"].get("api_key") == "set":
+        new_settings["relayer"].pop("api_key", None)
+    if isinstance(new_settings.get("chainlink"), dict) and new_settings["chainlink"].get("alchemy_api_key") == "set":
+        new_settings["chainlink"].pop("alchemy_api_key", None)
+    if isinstance(new_settings.get("telegram"), dict) and new_settings["telegram"].get("bot_token") == "set":
+        new_settings["telegram"].pop("bot_token", None)
 
     # Deep-merge into the existing config so keys not present in the settings form
     # (chainlink, binance_base_url, poll_interval_ms, etc.) are preserved.
@@ -1952,14 +1454,11 @@ async def post_settings(new_settings: Dict[str, Any]):
         settings.FLIP_MIN_CONVICTION = float(f.get("min_conviction", settings.FLIP_MIN_CONVICTION))
         settings.FLIP_MIN_MINUTES_LEFT = float(f.get("min_minutes_left", settings.FLIP_MIN_MINUTES_LEFT))
 
-    if "capital_extractor" in new_settings:
-        ce = new_settings["capital_extractor"]
-        if "enabled" in ce: settings.AUTO_WITHDRAW_ENABLED = bool(ce["enabled"])
-        if "trigger_balance" in ce: settings.WITHDRAW_TRIGGER_BALANCE = float(ce["trigger_balance"])
-        if "withdraw_amount" in ce: settings.WITHDRAW_AMOUNT = float(ce["withdraw_amount"])
-        if "withdraw_address" in ce: settings.WITHDRAW_ADDRESS = ce["withdraw_address"]
-        if "auto_resume_after_withdrawal" in ce: settings.WITHDRAW_AUTO_RESUME = bool(ce["auto_resume_after_withdrawal"])
-        if "resume_after" in ce: settings.WITHDRAW_RESUME_AFTER = ce["resume_after"]
+    if "tp_sl" in new_settings:
+        ts = new_settings["tp_sl"]
+        if "enabled" in ts: settings.TP_SL_ENABLED = bool(ts["enabled"])
+        settings.TAKE_PROFIT_PCT = float(ts.get("take_profit_pct", settings.TAKE_PROFIT_PCT))
+        settings.STOP_LOSS_PCT = float(ts.get("stop_loss_pct", settings.STOP_LOSS_PCT))
 
     if "telegram" in new_settings:
         tg = new_settings["telegram"]
@@ -1972,35 +1471,36 @@ async def post_settings(new_settings: Dict[str, Any]):
         settings.POLYMARKET_UP_LABEL = p.get("up_label", settings.POLYMARKET_UP_LABEL)
         settings.POLYMARKET_DOWN_LABEL = p.get("down_label", settings.POLYMARKET_DOWN_LABEL)
 
-    if "live" in new_settings:
-        lv = new_settings["live"]
-        if "max_slippage" in lv:
-            settings.CLOB_MAX_SLIPPAGE = float(lv["max_slippage"])
-        # A value still showing the "abc123...wxyz" mask was not edited — keep the real
-        # one rather than overwriting the secret with its own mask.
-        rk = lv.get("relayer_api_key")
-        if rk and "..." not in rk:
-            settings.RELAYER_API_KEY = rk
-            new_settings.setdefault("relayer", {})["api_key"] = rk
-        elif rk:
-            lv["relayer_api_key"] = settings.RELAYER_API_KEY
-        ak = lv.get("alchemy_api_key")
-        if ak and "..." not in ak:
-            settings.ALCHEMY_API_KEY = ak
-            new_settings.setdefault("chainlink", {})["alchemy_api_key"] = ak
-        elif ak:
-            lv["alchemy_api_key"] = settings.ALCHEMY_API_KEY
+    if "relayer" in new_settings and isinstance(new_settings["relayer"], dict):
+        if "api_key" in new_settings["relayer"]:
+            settings.RELAYER_API_KEY = new_settings["relayer"]["api_key"]
 
-    # Credentials/signature may have changed — drop the cached CLOB client so the
-    # next live order re-initialises with the new key/signature/funder.
+    if "chainlink" in new_settings and isinstance(new_settings["chainlink"], dict):
+        if "alchemy_api_key" in new_settings["chainlink"]:
+            settings.ALCHEMY_API_KEY = new_settings["chainlink"]["alchemy_api_key"]
+
+    if "capital_extractor" in new_settings:
+        ce = new_settings["capital_extractor"]
+        if "enabled" in ce: settings.AUTO_WITHDRAW_ENABLED = bool(ce["enabled"])
+        if "trigger_balance" in ce: settings.WITHDRAW_TRIGGER_BALANCE = float(ce["trigger_balance"])
+        if "withdraw_amount" in ce: settings.WITHDRAW_AMOUNT = float(ce["withdraw_amount"])
+        if "withdraw_address" in ce: settings.WITHDRAW_ADDRESS = ce["withdraw_address"]
+        if "auto_resume_after_withdrawal" in ce: settings.WITHDRAW_AUTO_RESUME = bool(ce["auto_resume_after_withdrawal"])
+        if "resume_after" in ce: settings.WITHDRAW_RESUME_AFTER = ce["resume_after"]
+
+    # Credentials may have changed — drop the cached CLOB client so the next live
+    # order re-initialises with the new key / relayer / alchemy settings.
     clob_trader.reset()
 
     state["trading_mode"] = settings.MODE
-    state["paper_balance"] = settings.PAPER_BALANCE_USD
+    # Only reset the displayed balance in paper mode; live mode reads the on-chain
+    # pUSD balance and we don't want to clobber it with the paper default on save.
+    if settings.MODE == "paper":
+        state["paper_balance"] = settings.PAPER_BALANCE_USD
 
     if settings.SYMBOL != old_symbol:
         binance_stream.close()
-        binance_stream = ws_data.BinanceTradeStream(symbol=settings.SYMBOL, on_update=_wake_entry)
+        binance_stream = ws_data.BinanceTradeStream(symbol=settings.SYMBOL)
         asyncio.create_task(binance_stream.start())
 
         binance_kline_1m.close()
@@ -2026,63 +1526,49 @@ async def post_settings(new_settings: Dict[str, Any]):
 
     return {"status": "ok"}
 
-@app.post("/api/setup-wallet")
-async def setup_wallet():
-    """One-time gasless on-chain setup for the deposit wallet: deploy it if needed and
-    set the token approvals, sponsored by the relayer key. Replaces the old manual EOA
-    allowance flow — under CLOB V2 you never pay gas for this."""
-    try:
-        result = await asyncio.to_thread(clob_trader.ensure_setup)
-        if result.get("ok"):
-            if result.get("skipped"):
-                log_message("Wallet setup: already done this session")
-            else:
-                log_message(f"Wallet setup complete ({result.get('approvals', 0)} approvals)")
-        else:
-            log_message(f"Wallet setup failed: {result.get('error')}")
-        return result
-    except Exception as e:
-        log_message(f"Wallet setup error: {e}")
-        return {"ok": False, "error": str(e)}
+def _reflect_running_now():
+    """Mirror the running flag into latest_data immediately so /api/latest is in sync
+    on the very next poll (the update loop would otherwise lag ~1s, flickering the UI)."""
+    ts = state["latest_data"].get("trading_state")
+    if isinstance(ts, dict):
+        ts["running"] = state["running"]
 
+@app.post("/api/start")
+async def start_trading():
+    """Begin trading. Data/prices stream continuously; this flips the gate so the
+    engine may enter/flip trades."""
+    state["running"] = True
+    _reflect_running_now()
+    log_message("Trading STARTED by user")
+    return {"ok": True, "running": True}
+
+@app.post("/api/stop")
+async def stop_trading():
+    """Stop all trading. New entries and flips halt immediately; any open position
+    keeps settling to expiry so it can't get stuck."""
+    state["running"] = False
+    _reflect_running_now()
+    log_message("Trading STOPPED by user")
+    return {"ok": True, "running": False}
 
 @app.post("/api/test-connection")
 async def test_connection():
-    """Read-only diagnostic: derive the EOA from the key/seed, list every candidate
-    wallet (deposit / proxy / safe) with its pUSD balance, and report which one will
-    actually be traded from. Needs no relayer key."""
-    try:
-        result = await asyncio.to_thread(clob_trader.test_connection)
-        if result.get("ok"):
-            log_message(f"Connection OK — EOA {result.get('eoa')}, trading from "
-                        f"{result.get('funder')} (sig type {result.get('chosen_signature_type')})")
-        else:
-            log_message(f"Connection test failed: {result.get('error')}")
-        return result
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
-
-
-@app.post("/api/enable-auto-redeem")
-async def enable_auto_redeem():
-    """Ask Polymarket to auto-redeem resolved positions, so winning outcome tokens
-    turn back into pUSD without the bot doing it per-trade."""
-    try:
-        result = await asyncio.to_thread(clob_trader.enable_auto_redeem)
-        log_message("Auto-redeem enabled" if result.get("ok")
-                    else f"Auto-redeem failed: {result.get('error')}")
-        return result
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
-
+    """Validate the saved key/seed + relayer: derive the EOA and candidate wallets and
+    report which one holds pUSD (the trading wallet) and the chosen signature type."""
+    result = await asyncio.to_thread(clob_trader.test_connection)
+    if result.get("ok"):
+        log_message(f"Connection test OK: EOA {result.get('eoa')} → trading wallet {result.get('funder')}"
+                    + ("" if result.get("relayer_key_set") else "  (relayer key MISSING)"))
+    else:
+        log_message(f"Connection test failed: {result.get('error')}")
+    return result
 
 @app.get("/api/telegram-subscribers")
 async def get_telegram_subscribers():
-    """Everyone currently receiving withdrawal alerts. They add themselves by sending
-    the bot /start — there are no chat IDs to copy by hand."""
+    """The list of chats that have started the bot (auto-collected) — shown on the
+    Settings page so you can see who receives alerts and remove anyone."""
     subs = [{"chat_id": cid, **info} for cid, info in state["telegram_subscribers"].items()]
     return {"count": len(subs), "subscribers": subs}
-
 
 @app.post("/api/telegram-unsubscribe")
 async def telegram_unsubscribe(body: Dict[str, Any]):
@@ -2092,7 +1578,6 @@ async def telegram_unsubscribe(body: Dict[str, Any]):
     if removed:
         log_message(f"Telegram subscriber removed by user: {cid}")
     return {"ok": removed, "count": len(state["telegram_subscribers"])}
-
 
 @app.post("/api/test-telegram")
 async def test_telegram():
@@ -2104,15 +1589,13 @@ async def test_telegram():
     if not state["telegram_subscribers"]:
         return {"ok": False, "error": "no_subscribers_yet — send /start to your bot first"}
     await send_telegram("✅ <b>Test alert</b>\nThis chat will receive withdrawal alerts from your "
-                        "Polymarket BTC 15m bot.")
+                        "Polymarket bot. Send /stop to unsubscribe.")
     log_message(f"Telegram test alert broadcast to {len(state['telegram_subscribers'])} subscriber(s)")
     return {"ok": True, "count": len(state["telegram_subscribers"])}
 
-
 @app.get("/health")
 async def health():
-    return {"status": "ok", "last_update": state["last_update_ts"], "mode": state["trading_mode"],
-            "running": state["running"]}
+    return {"status": "ok", "last_update": state["last_update_ts"], "mode": state["trading_mode"], "running": state["running"]}
 
 @app.get("/history")
 async def get_history():
